@@ -7,6 +7,8 @@ The library treats partition contents as opaque. It does not know or care
 what filesystem lives inside. It only needs a `Disk` that can read and
 write sectors and read/update a partition extent.
 
+NOTE: Vibe-coded with deepseek, i will debloat it sometime
+
 ## The problem
 
 A move from `[A, A+L)` to `[A+X, A+X+L)` is trivial when the extents are
