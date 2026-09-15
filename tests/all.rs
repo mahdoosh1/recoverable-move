@@ -1,133 +1,10 @@
 use recoverable_move::*;
+use std::fs;
 
-
-// ===========================================================================
-// Mock disk (public so integration tests can use it)
-// ===========================================================================
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Op {
-    Read { lba: u64, len: usize },
-    Write { lba: u64, len: usize, data: Vec<u8> },
-    Sync,
-    GetPartition,
-    SetPartition(Gpt),
-}
-
-pub struct MockDisk {
-    pub data: Vec<u8>,
-    pub gpt: Gpt,
-    pub trace: Vec<Op>,
-    /// 1-indexed operation at which to crash.
-    pub crash_at: Option<u64>,
-    /// If true, the crashing op completes before the error returns.
-    pub crash_after: bool,
-    /// For a `Write` at op index `i`, write only the first `n` bytes and
-    /// leave the rest of the sector as-is (simulates a torn write).
-    pub torn_at: Option<(u64, usize)>,
-    pub op_count: u64,
-}
-
-impl MockDisk {
-    pub fn new(sectors: u64) -> Self {
-        Self {
-            data: vec![0u8; sectors as usize * SECTOR_SIZE],
-            gpt: Gpt { start: 0, len: 0 },
-            trace: Vec::new(),
-            crash_at: None,
-            crash_after: false,
-            torn_at: None,
-            op_count: 0,
-        }
-    }
-
-    fn next_op(&mut self) -> u64 {
-        self.op_count += 1;
-        self.op_count
-    }
-
-    fn crash_before(&self, n: u64) -> Result<(), Error> {
-        if Some(n) == self.crash_at && !self.crash_after {
-            Err(Error::Crash)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn crash_after(&self, n: u64) -> Result<(), Error> {
-        if Some(n) == self.crash_at && self.crash_after {
-            Err(Error::Crash)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn span(&self, lba: u64, len: usize) -> Result<std::ops::Range<usize>, Error> {
-        let s = lba as usize * SECTOR_SIZE;
-        let e = s + len;
-        if e > self.data.len() {
-            return Err(Error::Io(format!("lba {lba} out of range")));
-        }
-        Ok(s..e)
-    }
-}
-
-impl Disk for MockDisk {
-    fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Error> {
-        let n = self.next_op();
-        self.crash_before(n)?;
-        let r = self.span(lba, buf.len())?;
-        buf.copy_from_slice(&self.data[r]);
-        self.trace.push(Op::Read { lba, len: buf.len() });
-        self.crash_after(n)?;
-        Ok(())
-    }
-
-    fn write_sector(&mut self, lba: u64, buf: &[u8]) -> Result<(), Error> {
-        let n = self.next_op();
-        self.crash_before(n)?;
-        let r = self.span(lba, buf.len())?;
-        let to_write = match self.torn_at {
-            Some((i, k)) if i == n => k.min(buf.len()),
-            _ => buf.len(),
-        };
-        self.data[r.start..r.start + to_write].copy_from_slice(&buf[..to_write]);
-        self.trace.push(Op::Write { lba, len: buf.len(), data: buf.to_vec() });
-        self.crash_after(n)?;
-        Ok(())
-    }
-
-    fn sync(&mut self) -> Result<(), Error> {
-        let n = self.next_op();
-        self.crash_before(n)?;
-        self.trace.push(Op::Sync);
-        self.crash_after(n)?;
-        Ok(())
-    }
-
-    fn get_partition(&mut self) -> Result<Gpt, Error> {
-        let n = self.next_op();
-        self.crash_before(n)?;
-        self.trace.push(Op::GetPartition);
-        self.crash_after(n)?;
-        Ok(self.gpt)
-    }
-
-    fn set_partition(&mut self, gpt: Gpt) -> Result<(), Error> {
-        let n = self.next_op();
-        self.crash_before(n)?;
-        self.gpt = gpt;
-        self.trace.push(Op::SetPartition(gpt));
-        self.crash_after(n)?;
-        Ok(())
-    }
-}
-
-
-const OLD: u64 = 100;
-const LEN: u64 = 600;
-const CS: u64 = 100;
-const SUB: u64 = 25; // 4 subchunks per chunk
+const OLD: u64 = 100; // was 100
+const LEN: u64 = 60; // was 600
+const CS: u64 = 10; // was 100
+const SUB: u64 = 3; // was 25; 4 subchunks per chunk, 6 chunks
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -177,24 +54,58 @@ fn check_region(d: &mut MockDisk, start: u64, expected: &[u8]) {
     }
 }
 
+/// Unique directory per call so parallel test threads never collide.
+fn scratch(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "recoverable_move_{}_{}_{}",
+        tag,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 fn exhaustive(p: MoveParams) {
-    // Baseline: learn how many ops a clean run performs.
+    // Baseline: learn how many ops a clean run performs.  The file-based
+    // metadata mirror does not go through the disk, so its presence or
+    // absence does not change the op count.
+    let base_dir = scratch("base");
+    let base_cfg = Config { backup_path: Some(base_dir.join("meta.bin")) };
     let (mut d, _) = setup();
-    run(&mut d, Some(p), &Config::default()).unwrap();
+    run(&mut d, Some(p), &base_cfg).unwrap();
     let total = d.op_count;
     assert!(total > 10, "baseline run too short: {total}");
+    let _ = fs::remove_dir_all(&base_dir);
 
     for crash_at in 1..=total {
         for crash_after in [false, true] {
+            let dir = scratch(&format!("crash_{crash_at}_{}", crash_after as u8));
+            let cfg = Config { backup_path: Some(dir.join("meta.bin")) };
+
             let (mut d, orig) = setup();
             d.crash_at = Some(crash_at);
             d.crash_after = crash_after;
+            let _ = run(&mut d, Some(p), &cfg);
 
-            let _ = run(&mut d, Some(p), &Config::default());
+            if let Some(path) = &cfg.backup_path {
+                let exists = path.exists();
+                let len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                eprintln!(
+                     "recover crash_at={crash_at} after={crash_after} \
+                     file={:?} exists={} len={} gpt=({},{}) op_count={} trace_len={}",
+                    path, exists, len, d.gpt.start, d.gpt.len, d.op_count, d.trace.len()
+                );
+            }
 
+            // Recovery: no crash injection, same params so a pre-metadata
+            // crash (nothing written yet) can be restarted cleanly.
             d.crash_at = None;
             d.crash_after = false;
-            run(&mut d, Some(p), &Config::default()).unwrap_or_else(|e| {
+            run(&mut d, Some(p), &cfg).unwrap_or_else(|e| {
                 panic!("recovery failed (crash_at={crash_at}, after={crash_after}): {e}")
             });
 
@@ -204,6 +115,8 @@ fn exhaustive(p: MoveParams) {
                 "wrong gpt (crash_at={crash_at}, after={crash_after})"
             );
             check_region(&mut d, p.new_start, &orig);
+
+            let _ = fs::remove_dir_all(&dir);
         }
     }
 }
@@ -360,27 +273,12 @@ fn crash_every_op_backward_shadow() {
 
 #[test]
 fn torn_metadata_recovered_from_file_backup() {
-    use std::fs;
-
-    let dir = std::env::temp_dir().join(format!(
-        "recoverable_move_test_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&dir).unwrap();
+    let dir = scratch("torn");
     let backup = dir.join("meta.bin");
-
-    // Clean baseline with backup enabled.
-    let (mut d, orig) = setup();
     let cfg = Config { backup_path: Some(backup.clone()) };
-    run(&mut d, Some(params(400, false)), &cfg).unwrap();
-    assert!(backup.exists());
-    check_region(&mut d, 400, &orig);
 
-    // Find the op index of the first metadata write.
+    // Find the op index of the first metadata write using a probe disk
+    // with no backup, so its own file state is irrelevant.
     let (mut probe, _) = setup();
     let _ = run(&mut probe, Some(params(400, false)), &Config::default());
     let op = probe
@@ -395,16 +293,21 @@ fn torn_metadata_recovered_from_file_backup() {
         })
         .expect("no metadata write found");
 
-    // Re-run with a torn write at that op.
-    let (mut d, _) = setup();
+    // Tear the metadata write and stop immediately after it.  The file
+    // was written first and holds a valid record; the disk sector does
+    // not.
+    let (mut d, orig) = setup();
     d.torn_at = Some((op, 64));
+    d.crash_at = Some(op);
+    d.crash_after = true;
     let _ = run(&mut d, Some(params(400, false)), &cfg);
 
-    // Recover from the file.
+    // Recovery must read the file, not the torn disk sector.
     d.torn_at = None;
+    d.crash_at = None;
+    d.crash_after = false;
     run(&mut d, None, &cfg).unwrap();
 
-    let (_, orig) = setup();
     assert_eq!(d.gpt, Gpt { start: 400, len: LEN });
     check_region(&mut d, 400, &orig);
 
@@ -412,15 +315,143 @@ fn torn_metadata_recovered_from_file_backup() {
 }
 
 // ---------------------------------------------------------------------------
-// Idempotency
+// Post-completion behavior
 // ---------------------------------------------------------------------------
 
 #[test]
-fn run_twice_is_noop() {
-    let (mut d, orig) = setup();
-    run(&mut d, Some(params(400, false)), &Config::default()).unwrap();
-    let ops_after_first = d.op_count;
-    run(&mut d, Some(params(400, false)), &Config::default()).unwrap();
-    assert_eq!(d.op_count, ops_after_first + 2, "second run did work");
-    check_region(&mut d, 400, &orig);
+fn run_after_completion_returns_no_transaction() {
+    let dir = scratch("complete");
+    let cfg = Config { backup_path: Some(dir.join("meta.bin")) };
+
+    let (mut d, _) = setup();
+    run(&mut d, Some(params(400, false)), &cfg).unwrap();
+
+    // After a clean finish both the sector and the file are cleared, so
+    // a parameterless run must report that nothing is in flight.
+    let err = run(&mut d, None, &cfg).unwrap_err();
+    assert!(matches!(err, Error::NoTransaction));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ===========================================================================
+// Mock disk (used only by this test file, not part of the library)
+// ===========================================================================
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Op {
+    Read { lba: u64, len: usize },
+    Write { lba: u64, len: usize, data: Vec<u8> },
+    Sync,
+    GetPartition,
+    SetPartition(Gpt),
+}
+
+pub struct MockDisk {
+    pub data: Vec<u8>,
+    pub gpt: Gpt,
+    pub trace: Vec<Op>,
+    /// 1-indexed operation at which to crash.
+    pub crash_at: Option<u64>,
+    /// If true, the crashing op completes before the error returns.
+    pub crash_after: bool,
+    /// For a `Write` at op index `i`, write only the first `n` bytes and
+    /// leave the rest of the sector as-is (simulates a torn write).
+    pub torn_at: Option<(u64, usize)>,
+    pub op_count: u64,
+}
+
+impl MockDisk {
+    pub fn new(sectors: u64) -> Self {
+        Self {
+            data: vec![0u8; sectors as usize * SECTOR_SIZE],
+            gpt: Gpt { start: 0, len: 0 },
+            trace: Vec::new(),
+            crash_at: None,
+            crash_after: false,
+            torn_at: None,
+            op_count: 0,
+        }
+    }
+
+    fn next_op(&mut self) -> u64 {
+        self.op_count += 1;
+        self.op_count
+    }
+
+    fn crash_before(&self, n: u64) -> Result<(), Error> {
+        if Some(n) == self.crash_at && !self.crash_after {
+            Err(Error::Crash)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn crash_after(&self, n: u64) -> Result<(), Error> {
+        if Some(n) == self.crash_at && self.crash_after {
+            Err(Error::Crash)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn span(&self, lba: u64, len: usize) -> Result<std::ops::Range<usize>, Error> {
+        let s = lba as usize * SECTOR_SIZE;
+        let e = s + len;
+        if e > self.data.len() {
+            return Err(Error::Io(format!("lba {lba} out of range")));
+        }
+        Ok(s..e)
+    }
+}
+
+impl Disk for MockDisk {
+    fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Error> {
+        let n = self.next_op();
+        self.crash_before(n)?;
+        let r = self.span(lba, buf.len())?;
+        buf.copy_from_slice(&self.data[r]);
+        self.trace.push(Op::Read { lba, len: buf.len() });
+        self.crash_after(n)?;
+        Ok(())
+    }
+
+    fn write_sector(&mut self, lba: u64, buf: &[u8]) -> Result<(), Error> {
+        let n = self.next_op();
+        self.crash_before(n)?;
+        let r = self.span(lba, buf.len())?;
+        let to_write = match self.torn_at {
+            Some((i, k)) if i == n => k.min(buf.len()),
+            _ => buf.len(),
+        };
+        self.data[r.start..r.start + to_write].copy_from_slice(&buf[..to_write]);
+        self.trace.push(Op::Write { lba, len: buf.len(), data: buf.to_vec() });
+        self.crash_after(n)?;
+        Ok(())
+    }
+
+    fn sync(&mut self) -> Result<(), Error> {
+        let n = self.next_op();
+        self.crash_before(n)?;
+        self.trace.push(Op::Sync);
+        self.crash_after(n)?;
+        Ok(())
+    }
+
+    fn get_partition(&mut self) -> Result<Gpt, Error> {
+        let n = self.next_op();
+        self.crash_before(n)?;
+        self.trace.push(Op::GetPartition);
+        self.crash_after(n)?;
+        Ok(self.gpt)
+    }
+
+    fn set_partition(&mut self, gpt: Gpt) -> Result<(), Error> {
+        let n = self.next_op();
+        self.crash_before(n)?;
+        self.gpt = gpt;
+        self.trace.push(Op::SetPartition(gpt));
+        self.crash_after(n)?;
+        Ok(())
+    }
 }

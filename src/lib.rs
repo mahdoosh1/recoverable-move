@@ -1,5 +1,6 @@
 //! Crash-recoverable overlapping partition move.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::io::Write as IoWrite;
@@ -7,18 +8,18 @@ use std::path::PathBuf;
 
 pub const SECTOR_SIZE: usize = 512;
 
-/// A sentinel / checkpoint occupies exactly one sector.
+/// A checkpoint occupies exactly one sector.
 pub const CHECKPOINT_SECTORS: u64 = 1;
 
-/// Example sizing, not a default.  32 GiB chunks / 128 MiB subchunks =
-/// 256 subchunks per chunk, one checkpoint at the end of each.
+/// Example sizing, not a default: 32 GiB chunks, 128 MiB subchunks,
+/// 256 subchunks per chunk, one checkpoint per subchunk.
 pub mod example {
     use super::SECTOR_SIZE;
     pub const SUBCHUNK_BYTES: u64 = 128 * 1024 * 1024;
     pub const CHUNK_BYTES: u64 = 32 * 1024 * 1024 * 1024;
-    pub const SUBCHUNK_SECTORS: u64 = SUBCHUNK_BYTES / SECTOR_SIZE as u64; // 262144
-    pub const CHUNK_SECTORS: u64 = CHUNK_BYTES / SECTOR_SIZE as u64;       // 67108864
-    pub const SUBCHUNKS_PER_CHUNK: u64 = CHUNK_SECTORS / SUBCHUNK_SECTORS; // 256
+    pub const SUBCHUNK_SECTORS: u64 = SUBCHUNK_BYTES / SECTOR_SIZE as u64;
+    pub const CHUNK_SECTORS: u64 = CHUNK_BYTES / SECTOR_SIZE as u64;
+    pub const SUBCHUNKS_PER_CHUNK: u64 = CHUNK_SECTORS / SUBCHUNK_SECTORS;
 }
 
 const MAGIC: u64 = 0x4D4F_5645_5041_5254;
@@ -125,10 +126,7 @@ pub struct Metadata {
     pub old_start: u64,
     pub len: u64,
     pub displacement: i64,
-    /// Chunk size, sectors.  Clamped to `|displacement|`.
     pub chunk_size: u64,
-    /// Subchunk size, sectors.  A checkpoint sits at the last sector of
-    /// each subchunk.
     pub subchunk_size: u64,
     pub chunks_total: u64,
     pub chunks_done: u64,
@@ -221,6 +219,9 @@ impl Metadata {
 
 #[derive(Clone, Debug, Default)]
 pub struct Config {
+    /// If set, every metadata update is mirrored to this file before the
+    /// sector write, and read back on recovery.  The file is load-bearing:
+    /// without it, a crash inside `do_resize` is unrecoverable.
     pub backup_path: Option<PathBuf>,
 }
 
@@ -283,12 +284,8 @@ fn is_sentinel(buf: &[u8]) -> bool {
     buf.iter().all(|&b| b == SENTINEL)
 }
 
-// ---------------------------------------------------------------------------
-// Checkpoint placement
-// ---------------------------------------------------------------------------
-
-/// Offsets within a chunk (0-based) that carry a checkpoint.  Each is the
-/// last sector of a subchunk, plus the final sector of the chunk if the
+/// Offsets within a chunk (0-based) that carry a checkpoint: the last
+/// sector of every subchunk, plus the final sector of the chunk if the
 /// chunk is not a whole multiple of the subchunk size.
 fn checkpoint_offsets(clen: u64, subchunk: u64) -> Vec<u64> {
     let mut v = Vec::new();
@@ -318,13 +315,14 @@ fn write_metadata(disk: &mut dyn Disk, lba: u64, m: &Metadata, cfg: &Config) -> 
     disk.sync()
 }
 
-fn read_metadata(disk: &mut dyn Disk, lba: u64, cfg: &Config) -> Result<Option<Metadata>, Error> {
-    let mut buf = [0u8; SECTOR_SIZE];
-    if disk.read_sector(lba, &mut buf).is_ok() {
-        if let Some(m) = Metadata::decode(&buf) {
-            return Ok(Some(m));
-        }
-    }
+/// Read the metadata, preferring the file over the disk.  The file is
+/// written first, so it is never stale relative to the sector.  Returns
+/// `None` if neither source carries a valid record.
+fn read_metadata(
+    disk: &mut dyn Disk,
+    lba: u64,
+    cfg: &Config,
+) -> Result<Option<Metadata>, Error> {
     if let Some(path) = &cfg.backup_path {
         if let Ok(data) = fs::read(path) {
             if let Some(m) = Metadata::decode(&data) {
@@ -332,7 +330,9 @@ fn read_metadata(disk: &mut dyn Disk, lba: u64, cfg: &Config) -> Result<Option<M
             }
         }
     }
-    Ok(None)
+    let mut buf = [0u8; SECTOR_SIZE];
+    disk.read_sector(lba, &mut buf)?;
+    Ok(Metadata::decode(&buf))
 }
 
 // ---------------------------------------------------------------------------
@@ -346,9 +346,8 @@ pub struct MoveParams {
     pub new_start: u64,
     /// Chunk size in sectors.  Clamped down to `|displacement|`.
     pub chunk_size: u64,
-    /// Subchunk size in sectors.  A checkpoint is placed at the last
-    /// sector of each subchunk.  Must be `>= CHECKPOINT_SECTORS` and
-    /// `<= chunk_size`.
+    /// Subchunk size in sectors.  A checkpoint sits at the last sector
+    /// of each subchunk.  Clamped down to `chunk_size`.
     pub subchunk_size: u64,
     pub uses_shadow: bool,
 }
@@ -357,6 +356,8 @@ pub struct MoveParams {
 // Entry points
 // ---------------------------------------------------------------------------
 
+/// Resume an interrupted move, or start a new one if `params` is supplied
+/// and no transaction is present.
 pub fn run(disk: &mut dyn Disk, params: Option<MoveParams>, cfg: &Config) -> Result<(), Error> {
     let gpt = disk.get_partition()?;
     if let Some(m) = read_metadata(disk, gpt.start, cfg)? {
@@ -368,6 +369,7 @@ pub fn run(disk: &mut dyn Disk, params: Option<MoveParams>, cfg: &Config) -> Res
     }
 }
 
+/// Begin a new move.
 pub fn start(disk: &mut dyn Disk, p: MoveParams, cfg: &Config) -> Result<(), Error> {
     let x = p.new_start as i64 - p.old_start as i64;
     if x == 0 {
@@ -507,7 +509,8 @@ fn copy_chunk(disk: &mut dyn Disk, m: &Metadata, ci: u64) -> Result<(), Error> {
     let (src, dst, clen) = chunk_bounds(m, ci);
     let checkpoints = checkpoint_offsets(clen, m.subchunk_size);
 
-    // Resume: stop at the first checkpoint that is not yet a sentinel.
+    // Resume: walk checkpoints in order, stop at the first that is not a
+    // sentinel.  Everything up to the last sentinel is considered done.
     let mut resume_off = 0u64;
     let mut buf = [0u8; SECTOR_SIZE];
     for &c in &checkpoints {
@@ -519,7 +522,7 @@ fn copy_chunk(disk: &mut dyn Disk, m: &Metadata, ci: u64) -> Result<(), Error> {
         }
     }
 
-    let cp_set: std::collections::HashSet<u64> = checkpoints.iter().copied().collect();
+    let cp_set: HashSet<u64> = checkpoints.iter().copied().collect();
     let sentinel = [SENTINEL; SECTOR_SIZE];
     let mut off = resume_off;
     while off < clen {
@@ -569,7 +572,7 @@ fn verify(disk: &mut dyn Disk, m: &Metadata) -> Result<(), Error> {
     Ok(())
 }
 
-fn do_resize(disk: &mut dyn Disk, meta_lba: u64, m: &Metadata, _cfg: &Config) -> Result<(), Error> {
+fn do_resize(disk: &mut dyn Disk, meta_lba: u64, m: &Metadata, cfg: &Config) -> Result<(), Error> {
     let final_start = (m.old_start as i64 + m.displacement) as u64;
     disk.set_partition(Gpt { start: final_start, len: m.len })?;
     disk.sync()?;
@@ -584,5 +587,9 @@ fn do_resize(disk: &mut dyn Disk, meta_lba: u64, m: &Metadata, _cfg: &Config) ->
         disk.write_sector(meta_lba, &zero)?;
     }
     disk.sync()?;
+
+    if let Some(path) = &cfg.backup_path {
+        let _ = fs::remove_file(path);
+    }
     Ok(())
 }
