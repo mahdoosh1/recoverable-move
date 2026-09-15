@@ -1,10 +1,9 @@
 use recoverable_move::*;
-use std::fs;
 
-const OLD: u64 = 100; // was 100
-const LEN: u64 = 60; // was 600
-const CS: u64 = 10; // was 100
-const SUB: u64 = 3; // was 25; 4 subchunks per chunk, 6 chunks
+const OLD: u64 = 100;
+const LEN: u64 = 60;
+const CS: u64 = 10;
+const SUB: u64 = 3;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -54,58 +53,24 @@ fn check_region(d: &mut MockDisk, start: u64, expected: &[u8]) {
     }
 }
 
-/// Unique directory per call so parallel test threads never collide.
-fn scratch(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "recoverable_move_{}_{}_{}",
-        tag,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 fn exhaustive(p: MoveParams) {
-    // Baseline: learn how many ops a clean run performs.  The file-based
-    // metadata mirror does not go through the disk, so its presence or
-    // absence does not change the op count.
-    let base_dir = scratch("base");
-    let base_cfg = Config { backup_path: Some(base_dir.join("meta.bin")) };
+    let mut base = MemStore::new();
     let (mut d, _) = setup();
-    run(&mut d, Some(p), &base_cfg).unwrap();
+    run(&mut d, Some(p), &mut base).unwrap();
     let total = d.op_count;
     assert!(total > 10, "baseline run too short: {total}");
-    let _ = fs::remove_dir_all(&base_dir);
 
     for crash_at in 1..=total {
         for crash_after in [false, true] {
-            let dir = scratch(&format!("crash_{crash_at}_{}", crash_after as u8));
-            let cfg = Config { backup_path: Some(dir.join("meta.bin")) };
-
+            let mut store = MemStore::new();
             let (mut d, orig) = setup();
             d.crash_at = Some(crash_at);
             d.crash_after = crash_after;
-            let _ = run(&mut d, Some(p), &cfg);
+            let _ = run(&mut d, Some(p), &mut store);
 
-            if let Some(path) = &cfg.backup_path {
-                let exists = path.exists();
-                let len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-                eprintln!(
-                     "recover crash_at={crash_at} after={crash_after} \
-                     file={:?} exists={} len={} gpt=({},{}) op_count={} trace_len={}",
-                    path, exists, len, d.gpt.start, d.gpt.len, d.op_count, d.trace.len()
-                );
-            }
-
-            // Recovery: no crash injection, same params so a pre-metadata
-            // crash (nothing written yet) can be restarted cleanly.
             d.crash_at = None;
             d.crash_after = false;
-            run(&mut d, Some(p), &cfg).unwrap_or_else(|e| {
+            run(&mut d, Some(p), &mut store).unwrap_or_else(|e| {
                 panic!("recovery failed (crash_at={crash_at}, after={crash_after}): {e}")
             });
 
@@ -115,8 +80,6 @@ fn exhaustive(p: MoveParams) {
                 "wrong gpt (crash_at={crash_at}, after={crash_after})"
             );
             check_region(&mut d, p.new_start, &orig);
-
-            let _ = fs::remove_dir_all(&dir);
         }
     }
 }
@@ -127,8 +90,6 @@ fn exhaustive(p: MoveParams) {
 
 #[test]
 fn checkpoint_offsets_match_subchunk_boundaries() {
-    // Mirrors the library's private helper; documents the expected
-    // placement of checkpoints within a chunk.
     let expect = |clen: u64, sub: u64| -> Vec<u64> {
         let mut v = Vec::new();
         let mut off = sub;
@@ -178,23 +139,23 @@ fn invalid_metadata_rejected() {
 #[test]
 fn clean_forward_no_shadow() {
     let (mut d, orig) = setup();
-    run(&mut d, Some(params(400, false)), &Config::default()).unwrap();
-    assert_eq!(d.gpt, Gpt { start: 400, len: LEN });
-    check_region(&mut d, 400, &orig);
+    run(&mut d, Some(params(200, false)), &mut MemStore::new()).unwrap();
+    assert_eq!(d.gpt, Gpt { start: 200, len: LEN });
+    check_region(&mut d, 200, &orig);
 }
 
 #[test]
 fn clean_forward_shadow() {
     let (mut d, orig) = setup();
-    run(&mut d, Some(params(400, true)), &Config::default()).unwrap();
-    assert_eq!(d.gpt, Gpt { start: 400, len: LEN });
-    check_region(&mut d, 400, &orig);
+    run(&mut d, Some(params(200, true)), &mut MemStore::new()).unwrap();
+    assert_eq!(d.gpt, Gpt { start: 200, len: LEN });
+    check_region(&mut d, 200, &orig);
 }
 
 #[test]
 fn clean_backward_no_shadow() {
     let (mut d, orig) = setup();
-    run(&mut d, Some(params(50, false)), &Config::default()).unwrap();
+    run(&mut d, Some(params(50, false)), &mut MemStore::new()).unwrap();
     assert_eq!(d.gpt, Gpt { start: 50, len: LEN });
     check_region(&mut d, 50, &orig);
 }
@@ -202,7 +163,7 @@ fn clean_backward_no_shadow() {
 #[test]
 fn clean_backward_shadow() {
     let (mut d, orig) = setup();
-    run(&mut d, Some(params(50, true)), &Config::default()).unwrap();
+    run(&mut d, Some(params(50, true)), &mut MemStore::new()).unwrap();
     assert_eq!(d.gpt, Gpt { start: 50, len: LEN });
     check_region(&mut d, 50, &orig);
 }
@@ -214,7 +175,7 @@ fn clean_backward_shadow() {
 #[test]
 fn trace_phase_sequence() {
     let (mut d, _) = setup();
-    run(&mut d, Some(params(400, false)), &Config::default()).unwrap();
+    run(&mut d, Some(params(200, false)), &mut MemStore::new()).unwrap();
 
     let meta_lba = 99; // no-shadow, u=100 -> meta at 99
     let phases: Vec<Phase> = d
@@ -249,12 +210,12 @@ fn trace_phase_sequence() {
 
 #[test]
 fn crash_every_op_forward_no_shadow() {
-    exhaustive(params(400, false));
+    exhaustive(params(200, false));
 }
 
 #[test]
 fn crash_every_op_forward_shadow() {
-    exhaustive(params(400, true));
+    exhaustive(params(200, true));
 }
 
 #[test]
@@ -272,46 +233,36 @@ fn crash_every_op_backward_shadow() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn torn_metadata_recovered_from_file_backup() {
-    let dir = scratch("torn");
-    let backup = dir.join("meta.bin");
-    let cfg = Config { backup_path: Some(backup.clone()) };
-
-    // Find the op index of the first metadata write using a probe disk
-    // with no backup, so its own file state is irrelevant.
+fn torn_metadata_recovered_from_mem_backup() {
+    // Locate the first metadata write with a probe run.
     let (mut probe, _) = setup();
-    let _ = run(&mut probe, Some(params(400, false)), &Config::default());
+    let _ = run(&mut probe, Some(params(200, false)), &mut MemStore::new());
     let op = probe
         .trace
         .iter()
         .enumerate()
         .find_map(|(i, o)| match o {
-            Op::Write { data, .. } if Metadata::decode(data).is_some() => {
-                Some(i as u64 + 1)
-            }
+            Op::Write { data, .. } if Metadata::decode(data).is_some() => Some(i as u64 + 1),
             _ => None,
         })
         .expect("no metadata write found");
 
-    // Tear the metadata write and stop immediately after it.  The file
-    // was written first and holds a valid record; the disk sector does
-    // not.
+    // Tear the metadata write and crash right after it.
+    let mut store = MemStore::new();
     let (mut d, orig) = setup();
     d.torn_at = Some((op, 64));
     d.crash_at = Some(op);
     d.crash_after = true;
-    let _ = run(&mut d, Some(params(400, false)), &cfg);
+    let _ = run(&mut d, Some(params(200, false)), &mut store);
 
-    // Recovery must read the file, not the torn disk sector.
+    // Recovery reads the store, not the torn sector.
     d.torn_at = None;
     d.crash_at = None;
     d.crash_after = false;
-    run(&mut d, None, &cfg).unwrap();
+    run(&mut d, None, &mut store).unwrap();
 
-    assert_eq!(d.gpt, Gpt { start: 400, len: LEN });
-    check_region(&mut d, 400, &orig);
-
-    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(d.gpt, Gpt { start: 200, len: LEN });
+    check_region(&mut d, 200, &orig);
 }
 
 // ---------------------------------------------------------------------------
@@ -320,22 +271,16 @@ fn torn_metadata_recovered_from_file_backup() {
 
 #[test]
 fn run_after_completion_returns_no_transaction() {
-    let dir = scratch("complete");
-    let cfg = Config { backup_path: Some(dir.join("meta.bin")) };
-
+    let mut store = MemStore::new();
     let (mut d, _) = setup();
-    run(&mut d, Some(params(400, false)), &cfg).unwrap();
+    run(&mut d, Some(params(200, false)), &mut store).unwrap();
 
-    // After a clean finish both the sector and the file are cleared, so
-    // a parameterless run must report that nothing is in flight.
-    let err = run(&mut d, None, &cfg).unwrap_err();
+    let err = run(&mut d, None, &mut store).unwrap_err();
     assert!(matches!(err, Error::NoTransaction));
-
-    let _ = fs::remove_dir_all(&dir);
 }
 
 // ===========================================================================
-// Mock disk (used only by this test file, not part of the library)
+// Mock disk (used only by this test file)
 // ===========================================================================
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -351,12 +296,8 @@ pub struct MockDisk {
     pub data: Vec<u8>,
     pub gpt: Gpt,
     pub trace: Vec<Op>,
-    /// 1-indexed operation at which to crash.
     pub crash_at: Option<u64>,
-    /// If true, the crashing op completes before the error returns.
     pub crash_after: bool,
-    /// For a `Write` at op index `i`, write only the first `n` bytes and
-    /// leave the rest of the sector as-is (simulates a torn write).
     pub torn_at: Option<(u64, usize)>,
     pub op_count: u64,
 }

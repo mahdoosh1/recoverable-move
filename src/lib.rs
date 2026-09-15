@@ -7,12 +7,8 @@ use std::io::Write as IoWrite;
 use std::path::PathBuf;
 
 pub const SECTOR_SIZE: usize = 512;
-
-/// A checkpoint occupies exactly one sector.
 pub const CHECKPOINT_SECTORS: u64 = 1;
 
-/// Example sizing, not a default: 32 GiB chunks, 128 MiB subchunks,
-/// 256 subchunks per chunk, one checkpoint per subchunk.
 pub mod example {
     use super::SECTOR_SIZE;
     pub const SUBCHUNK_BYTES: u64 = 128 * 1024 * 1024;
@@ -100,6 +96,88 @@ pub trait Disk {
     fn sync(&mut self) -> Result<(), Error>;
     fn get_partition(&mut self) -> Result<Gpt, Error>;
     fn set_partition(&mut self, gpt: Gpt) -> Result<(), Error>;
+}
+
+// ---------------------------------------------------------------------------
+// Metadata backup store
+// ---------------------------------------------------------------------------
+
+/// Out-of-band mirror of the metadata sector.  The mirror is written
+/// *before* the sector, so it is never stale relative to the disk.  It is
+/// load-bearing: without it, a crash inside the resize phase is
+/// unrecoverable because the metadata sector has already been overwritten
+/// by moved data.
+pub trait MetaStore {
+    fn write(&mut self, data: &[u8]) -> Result<(), Error>;
+    /// `Ok(None)` means "no record here"; `Err` means the read itself
+    /// failed and recovery must not treat the absence as authoritative.
+    fn read(&mut self) -> Result<Option<Vec<u8>>, Error>;
+    fn remove(&mut self);
+}
+
+/// A store that does nothing.  Suitable only when the caller knows the
+/// resize phase cannot be interrupted (e.g. battery-backed write cache).
+pub struct NullStore;
+
+impl MetaStore for NullStore {
+    fn write(&mut self, _data: &[u8]) -> Result<(), Error> { Ok(()) }
+    fn read(&mut self) -> Result<Option<Vec<u8>>, Error> { Ok(None) }
+    fn remove(&mut self) {}
+}
+
+/// File-backed store.  The only place in the crate that touches `std::fs`.
+pub struct FileStore {
+    path: PathBuf,
+}
+
+impl FileStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl MetaStore for FileStore {
+    fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        let mut f = fs::File::create(&self.path).map_err(|e| Error::Io(e.to_string()))?;
+        f.write_all(data).map_err(|e| Error::Io(e.to_string()))?;
+        f.sync_all().map_err(|e| Error::Io(e.to_string()))?;
+        Ok(())
+    }
+    fn read(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        match fs::read(&self.path) {
+            Ok(d) => Ok(Some(d)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::Io(e.to_string())),
+        }
+    }
+    fn remove(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// In-memory store for tests.  No filesystem, no syscalls, no fsync.
+#[derive(Default)]
+pub struct MemStore {
+    data: Option<Vec<u8>>,
+}
+
+impl MemStore {
+    pub fn new() -> Self {
+        Self { data: None }
+    }
+}
+
+impl MetaStore for MemStore {
+    fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        self.data = Some(data.to_vec());
+        Ok(())
+    }
+    fn read(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        Ok(self.data.clone())
+    }
+    fn remove(&mut self) {
+        self.data = None;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -214,18 +292,6 @@ impl Metadata {
 }
 
 // ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug, Default)]
-pub struct Config {
-    /// If set, every metadata update is mirrored to this file before the
-    /// sector write, and read back on recovery.  The file is load-bearing:
-    /// without it, a crash inside `do_resize` is unrecoverable.
-    pub backup_path: Option<PathBuf>,
-}
-
-// ---------------------------------------------------------------------------
 // Geometry helpers
 // ---------------------------------------------------------------------------
 
@@ -284,9 +350,6 @@ fn is_sentinel(buf: &[u8]) -> bool {
     buf.iter().all(|&b| b == SENTINEL)
 }
 
-/// Offsets within a chunk (0-based) that carry a checkpoint: the last
-/// sector of every subchunk, plus the final sector of the chunk if the
-/// chunk is not a whole multiple of the subchunk size.
 fn checkpoint_offsets(clen: u64, subchunk: u64) -> Vec<u64> {
     let mut v = Vec::new();
     let mut off = subchunk;
@@ -304,30 +367,26 @@ fn checkpoint_offsets(clen: u64, subchunk: u64) -> Vec<u64> {
 // Metadata persistence
 // ---------------------------------------------------------------------------
 
-fn write_metadata(disk: &mut dyn Disk, lba: u64, m: &Metadata, cfg: &Config) -> Result<(), Error> {
+fn write_metadata(
+    disk: &mut dyn Disk,
+    lba: u64,
+    m: &Metadata,
+    store: &mut dyn MetaStore,
+) -> Result<(), Error> {
     let buf = m.encode();
-    if let Some(path) = &cfg.backup_path {
-        let mut f = fs::File::create(path).map_err(|e| Error::Io(e.to_string()))?;
-        f.write_all(&buf).map_err(|e| Error::Io(e.to_string()))?;
-        f.sync_all().map_err(|e| Error::Io(e.to_string()))?;
-    }
+    store.write(&buf)?;
     disk.write_sector(lba, &buf)?;
     disk.sync()
 }
 
-/// Read the metadata, preferring the file over the disk.  The file is
-/// written first, so it is never stale relative to the sector.  Returns
-/// `None` if neither source carries a valid record.
 fn read_metadata(
     disk: &mut dyn Disk,
     lba: u64,
-    cfg: &Config,
+    store: &mut dyn MetaStore,
 ) -> Result<Option<Metadata>, Error> {
-    if let Some(path) = &cfg.backup_path {
-        if let Ok(data) = fs::read(path) {
-            if let Some(m) = Metadata::decode(&data) {
-                return Ok(Some(m));
-            }
+    if let Some(data) = store.read()? {
+        if let Some(m) = Metadata::decode(&data) {
+            return Ok(Some(m));
         }
     }
     let mut buf = [0u8; SECTOR_SIZE];
@@ -344,10 +403,7 @@ pub struct MoveParams {
     pub old_start: u64,
     pub len: u64,
     pub new_start: u64,
-    /// Chunk size in sectors.  Clamped down to `|displacement|`.
     pub chunk_size: u64,
-    /// Subchunk size in sectors.  A checkpoint sits at the last sector
-    /// of each subchunk.  Clamped down to `chunk_size`.
     pub subchunk_size: u64,
     pub uses_shadow: bool,
 }
@@ -356,21 +412,26 @@ pub struct MoveParams {
 // Entry points
 // ---------------------------------------------------------------------------
 
-/// Resume an interrupted move, or start a new one if `params` is supplied
-/// and no transaction is present.
-pub fn run(disk: &mut dyn Disk, params: Option<MoveParams>, cfg: &Config) -> Result<(), Error> {
+pub fn run(
+    disk: &mut dyn Disk,
+    params: Option<MoveParams>,
+    store: &mut dyn MetaStore,
+) -> Result<(), Error> {
     let gpt = disk.get_partition()?;
-    if let Some(m) = read_metadata(disk, gpt.start, cfg)? {
-        return resume(disk, metadata_lba(&m), m, cfg);
+    if let Some(m) = read_metadata(disk, gpt.start, store)? {
+        return resume(disk, metadata_lba(&m), m, store);
     }
     match params {
-        Some(p) => start(disk, p, cfg),
+        Some(p) => start(disk, p, store),
         None => Err(Error::NoTransaction),
     }
 }
 
-/// Begin a new move.
-pub fn start(disk: &mut dyn Disk, p: MoveParams, cfg: &Config) -> Result<(), Error> {
+pub fn start(
+    disk: &mut dyn Disk,
+    p: MoveParams,
+    store: &mut dyn MetaStore,
+) -> Result<(), Error> {
     let x = p.new_start as i64 - p.old_start as i64;
     if x == 0 {
         return Err(Error::InvalidParams("zero displacement".into()));
@@ -423,8 +484,8 @@ pub fn start(disk: &mut dyn Disk, p: MoveParams, cfg: &Config) -> Result<(), Err
         disk.sync()?;
     }
 
-    write_metadata(disk, metadata_lba(&m), &m, cfg)?;
-    resume(disk, metadata_lba(&m), m, cfg)
+    write_metadata(disk, metadata_lba(&m), &m, store)?;
+    resume(disk, metadata_lba(&m), m, store)
 }
 
 // ---------------------------------------------------------------------------
@@ -435,26 +496,26 @@ fn resume(
     disk: &mut dyn Disk,
     meta_lba: u64,
     mut m: Metadata,
-    cfg: &Config,
+    store: &mut dyn MetaStore,
 ) -> Result<(), Error> {
     loop {
         match m.phase {
             Phase::Init => {
                 m.phase = Phase::Zero;
-                write_metadata(disk, meta_lba, &m, cfg)?;
+                write_metadata(disk, meta_lba, &m, store)?;
             }
 
             Phase::Zero => {
                 if m.chunks_done >= m.chunks_total {
                     m.phase = Phase::Verify;
-                    write_metadata(disk, meta_lba, &m, cfg)?;
+                    write_metadata(disk, meta_lba, &m, store)?;
                     continue;
                 }
                 let ci = processing_index(&m, m.chunks_done);
                 zero_checkpoints(disk, &m, ci)?;
                 disk.sync()?;
                 m.phase = Phase::Copy;
-                write_metadata(disk, meta_lba, &m, cfg)?;
+                write_metadata(disk, meta_lba, &m, store)?;
             }
 
             Phase::Copy => {
@@ -462,7 +523,7 @@ fn resume(
                 copy_chunk(disk, &m, ci)?;
                 disk.sync()?;
                 m.phase = Phase::Finalize;
-                write_metadata(disk, meta_lba, &m, cfg)?;
+                write_metadata(disk, meta_lba, &m, store)?;
             }
 
             Phase::Finalize => {
@@ -475,17 +536,17 @@ fn resume(
                 } else {
                     Phase::Zero
                 };
-                write_metadata(disk, meta_lba, &m, cfg)?;
+                write_metadata(disk, meta_lba, &m, store)?;
             }
 
             Phase::Verify => {
                 verify(disk, &m)?;
                 m.phase = Phase::Resize;
-                write_metadata(disk, meta_lba, &m, cfg)?;
+                write_metadata(disk, meta_lba, &m, store)?;
             }
 
             Phase::Resize => {
-                return do_resize(disk, meta_lba, &m, cfg);
+                return do_resize(disk, meta_lba, &m, store);
             }
         }
     }
@@ -509,8 +570,6 @@ fn copy_chunk(disk: &mut dyn Disk, m: &Metadata, ci: u64) -> Result<(), Error> {
     let (src, dst, clen) = chunk_bounds(m, ci);
     let checkpoints = checkpoint_offsets(clen, m.subchunk_size);
 
-    // Resume: walk checkpoints in order, stop at the first that is not a
-    // sentinel.  Everything up to the last sentinel is considered done.
     let mut resume_off = 0u64;
     let mut buf = [0u8; SECTOR_SIZE];
     for &c in &checkpoints {
@@ -572,7 +631,12 @@ fn verify(disk: &mut dyn Disk, m: &Metadata) -> Result<(), Error> {
     Ok(())
 }
 
-fn do_resize(disk: &mut dyn Disk, meta_lba: u64, m: &Metadata, cfg: &Config) -> Result<(), Error> {
+fn do_resize(
+    disk: &mut dyn Disk,
+    meta_lba: u64,
+    m: &Metadata,
+    store: &mut dyn MetaStore,
+) -> Result<(), Error> {
     let final_start = (m.old_start as i64 + m.displacement) as u64;
     disk.set_partition(Gpt { start: final_start, len: m.len })?;
     disk.sync()?;
@@ -588,8 +652,6 @@ fn do_resize(disk: &mut dyn Disk, meta_lba: u64, m: &Metadata, cfg: &Config) -> 
     }
     disk.sync()?;
 
-    if let Some(path) = &cfg.backup_path {
-        let _ = fs::remove_file(path);
-    }
+    store.remove();
     Ok(())
 }
