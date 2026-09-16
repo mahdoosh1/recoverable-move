@@ -1,4 +1,4 @@
-use recoverable_move::*;
+use recoverable_move::mover::*;
 
 const OLD: u64 = 100;
 const LEN: u64 = 60;
@@ -29,14 +29,19 @@ fn setup() -> (MockDisk, Vec<u8>) {
     (d, orig)
 }
 
-fn params(new_start: u64, shadow: bool) -> MoveParams {
+fn setup_with(blocked_lba: Option<u64>) -> (MockDisk, Vec<u8>) {
+    let (mut d, orig) = setup();
+    d.blocked_lba = blocked_lba;
+    (d, orig)
+}
+
+fn params(new_start: u64) -> MoveParams {
     MoveParams {
         old_start: OLD,
         len: LEN,
         new_start,
         chunk_size: CS,
         subchunk_size: SUB,
-        uses_shadow: shadow,
     }
 }
 
@@ -53,9 +58,9 @@ fn check_region(d: &mut MockDisk, start: u64, expected: &[u8]) {
     }
 }
 
-fn exhaustive(p: MoveParams) {
+fn exhaustive(p: MoveParams, blocked_lba: Option<u64>) {
     let mut base = MemStore::new();
-    let (mut d, _) = setup();
+    let (mut d, _) = setup_with(blocked_lba);
     run(&mut d, Some(p), &mut base).unwrap();
     let total = d.op_count;
     assert!(total > 10, "baseline run too short: {total}");
@@ -63,7 +68,7 @@ fn exhaustive(p: MoveParams) {
     for crash_at in 1..=total {
         for crash_after in [false, true] {
             let mut store = MemStore::new();
-            let (mut d, orig) = setup();
+            let (mut d, orig) = setup_with(blocked_lba);
             d.crash_at = Some(crash_at);
             d.crash_after = crash_after;
             let _ = run(&mut d, Some(p), &mut store);
@@ -112,12 +117,12 @@ fn checkpoint_offsets_match_subchunk_boundaries() {
 fn invalid_metadata_rejected() {
     let bad = Metadata {
         phase: Phase::Init,
-        uses_shadow: false,
+        widen_forward: false,
         old_start: 100,
-        len: 600,
+        len: 60,
         displacement: 0,
-        chunk_size: 100,
-        subchunk_size: 25,
+        chunk_size: 10,
+        subchunk_size: 3,
         chunks_total: 6,
         chunks_done: 0,
     };
@@ -126,10 +131,22 @@ fn invalid_metadata_rejected() {
     let bad2 = Metadata {
         displacement: 100,
         chunks_done: 7,
-        chunks_total: 6,
         ..bad
     };
     assert!(bad2.validate().is_err());
+
+    let bad3 = Metadata {
+        phase: Phase::Init,
+        widen_forward: false,
+        old_start: 0,
+        len: 60,
+        displacement: 100,
+        chunk_size: 10,
+        subchunk_size: 3,
+        chunks_total: 6,
+        chunks_done: 0,
+    };
+    assert!(bad3.validate().is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -137,33 +154,33 @@ fn invalid_metadata_rejected() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn clean_forward_no_shadow() {
-    let (mut d, orig) = setup();
-    run(&mut d, Some(params(200, false)), &mut MemStore::new()).unwrap();
+fn clean_forward_widened_backward() {
+    let (mut d, orig) = setup_with(None);
+    run(&mut d, Some(params(200)), &mut MemStore::new()).unwrap();
     assert_eq!(d.gpt, Gpt { start: 200, len: LEN });
     check_region(&mut d, 200, &orig);
 }
 
 #[test]
-fn clean_forward_shadow() {
-    let (mut d, orig) = setup();
-    run(&mut d, Some(params(200, true)), &mut MemStore::new()).unwrap();
+fn clean_forward_widened_forward() {
+    let (mut d, orig) = setup_with(Some(OLD - 1));
+    run(&mut d, Some(params(200)), &mut MemStore::new()).unwrap();
     assert_eq!(d.gpt, Gpt { start: 200, len: LEN });
     check_region(&mut d, 200, &orig);
 }
 
 #[test]
-fn clean_backward_no_shadow() {
-    let (mut d, orig) = setup();
-    run(&mut d, Some(params(50, false)), &mut MemStore::new()).unwrap();
+fn clean_backward_widened_backward() {
+    let (mut d, orig) = setup_with(None);
+    run(&mut d, Some(params(50)), &mut MemStore::new()).unwrap();
     assert_eq!(d.gpt, Gpt { start: 50, len: LEN });
     check_region(&mut d, 50, &orig);
 }
 
 #[test]
-fn clean_backward_shadow() {
-    let (mut d, orig) = setup();
-    run(&mut d, Some(params(50, true)), &mut MemStore::new()).unwrap();
+fn clean_backward_widened_forward() {
+    let (mut d, orig) = setup_with(Some(50 - 1));
+    run(&mut d, Some(params(50)), &mut MemStore::new()).unwrap();
     assert_eq!(d.gpt, Gpt { start: 50, len: LEN });
     check_region(&mut d, 50, &orig);
 }
@@ -174,10 +191,11 @@ fn clean_backward_shadow() {
 
 #[test]
 fn trace_phase_sequence() {
-    let (mut d, _) = setup();
-    run(&mut d, Some(params(200, false)), &mut MemStore::new()).unwrap();
+    let (mut d, _) = setup_with(Some(OLD - 1));
+    run(&mut d, Some(params(200)), &mut MemStore::new()).unwrap();
 
-    let meta_lba = 99; // no-shadow, u=100 -> meta at 99
+    // Forward, widened forward: metadata at partition_start = 100.
+    let meta_lba = OLD;
     let phases: Vec<Phase> = d
         .trace
         .iter()
@@ -205,38 +223,37 @@ fn trace_phase_sequence() {
 }
 
 // ---------------------------------------------------------------------------
-// Exhaustive crash injection (the important ones)
+// Exhaustive crash injection
 // ---------------------------------------------------------------------------
 
 #[test]
-fn crash_every_op_forward_no_shadow() {
-    exhaustive(params(200, false));
+fn crash_every_op_forward_widened_backward() {
+    exhaustive(params(200), None);
 }
 
 #[test]
-fn crash_every_op_forward_shadow() {
-    exhaustive(params(200, true));
+fn crash_every_op_forward_widened_forward() {
+    exhaustive(params(200), Some(OLD - 1));
 }
 
 #[test]
-fn crash_every_op_backward_no_shadow() {
-    exhaustive(params(50, false));
+fn crash_every_op_backward_widened_backward() {
+    exhaustive(params(50), None);
 }
 
 #[test]
-fn crash_every_op_backward_shadow() {
-    exhaustive(params(50, true));
+fn crash_every_op_backward_widened_forward() {
+    exhaustive(params(50), Some(50 - 1));
 }
 
 // ---------------------------------------------------------------------------
-// Torn metadata write + file backup
+// Torn metadata write + backup store
 // ---------------------------------------------------------------------------
 
 #[test]
 fn torn_metadata_recovered_from_mem_backup() {
-    // Locate the first metadata write with a probe run.
-    let (mut probe, _) = setup();
-    let _ = run(&mut probe, Some(params(200, false)), &mut MemStore::new());
+    let (mut probe, _) = setup_with(Some(OLD - 1));
+    let _ = run(&mut probe, Some(params(200)), &mut MemStore::new());
     let op = probe
         .trace
         .iter()
@@ -247,15 +264,13 @@ fn torn_metadata_recovered_from_mem_backup() {
         })
         .expect("no metadata write found");
 
-    // Tear the metadata write and crash right after it.
     let mut store = MemStore::new();
-    let (mut d, orig) = setup();
+    let (mut d, orig) = setup_with(Some(OLD - 1));
     d.torn_at = Some((op, 64));
     d.crash_at = Some(op);
     d.crash_after = true;
-    let _ = run(&mut d, Some(params(200, false)), &mut store);
+    let _ = run(&mut d, Some(params(200)), &mut store);
 
-    // Recovery reads the store, not the torn sector.
     d.torn_at = None;
     d.crash_at = None;
     d.crash_after = false;
@@ -272,15 +287,15 @@ fn torn_metadata_recovered_from_mem_backup() {
 #[test]
 fn run_after_completion_returns_no_transaction() {
     let mut store = MemStore::new();
-    let (mut d, _) = setup();
-    run(&mut d, Some(params(200, false)), &mut store).unwrap();
+    let (mut d, _) = setup_with(None);
+    run(&mut d, Some(params(200)), &mut store).unwrap();
 
     let err = run(&mut d, None, &mut store).unwrap_err();
     assert!(matches!(err, Error::NoTransaction));
 }
 
 // ===========================================================================
-// Mock disk (used only by this test file)
+// Mock disk
 // ===========================================================================
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -290,6 +305,8 @@ pub enum Op {
     Sync,
     GetPartition,
     SetPartition(Gpt),
+    IsSectorFree { lba: u64 },
+    IsRangeFree { start: u64, end: u64 },
 }
 
 pub struct MockDisk {
@@ -300,6 +317,9 @@ pub struct MockDisk {
     pub crash_after: bool,
     pub torn_at: Option<(u64, usize)>,
     pub op_count: u64,
+    /// If set, `is_sector_free` returns false for exactly this LBA and
+    /// `is_range_free` returns false for any range containing it.
+    pub blocked_lba: Option<u64>,
 }
 
 impl MockDisk {
@@ -312,6 +332,7 @@ impl MockDisk {
             crash_after: false,
             torn_at: None,
             op_count: 0,
+            blocked_lba: None,
         }
     }
 
@@ -394,5 +415,26 @@ impl Disk for MockDisk {
         self.trace.push(Op::SetPartition(gpt));
         self.crash_after(n)?;
         Ok(())
+    }
+
+    fn is_sector_free(&mut self, lba: u64) -> Result<bool, Error> {
+        let n = self.next_op();
+        self.crash_before(n)?;
+        let free = Some(lba) != self.blocked_lba;
+        self.trace.push(Op::IsSectorFree { lba });
+        self.crash_after(n)?;
+        Ok(free)
+    }
+
+    fn is_range_free(&mut self, start: u64, end: u64) -> Result<bool, Error> {
+        let n = self.next_op();
+        self.crash_before(n)?;
+        let free = match self.blocked_lba {
+            Some(b) => !(b >= start && b < end),
+            None => true,
+        };
+        self.trace.push(Op::IsRangeFree { start, end });
+        self.crash_after(n)?;
+        Ok(free)
     }
 }
