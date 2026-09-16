@@ -509,13 +509,11 @@ fn read_metadata(
     lba: u64,
     store: &mut Option<&mut dyn MetaStore>,
 ) -> Result<Option<Metadata>, Error> {
-    if let Some(s) = store.as_deref_mut() {
-        if let Some(data) = s.read()? {
-            if let Some(m) = Metadata::decode(&data) {
+    if let Some(s) = store.as_deref_mut()
+        && let Some(data) = s.read()?
+            && let Some(m) = Metadata::decode(&data) {
                 return Ok(Some(m));
             }
-        }
-    }
     let mut buf = [0u8; SECTOR_SIZE];
     disk.read_sector(lba, &mut buf)?;
     Ok(Metadata::decode(&buf))
