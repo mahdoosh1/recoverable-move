@@ -249,7 +249,7 @@ impl Metadata {
     pub const fn phase(self) -> Phase { self.phase }
     pub const fn widen_forward(self) -> bool { self.widen_forward }
     pub const fn old_start(self) -> u64 { self.old_start }
-    pub const fn len(self) -> u64 { self.len }
+    pub const fn partition_len(self) -> u64 { self.len }
     pub const fn displacement(self) -> i64 { self.displacement }
     pub const fn chunk_size(self) -> u64 { self.chunk_size }
     pub const fn subchunk_size(self) -> u64 { self.subchunk_size }
@@ -457,7 +457,7 @@ fn chunk_bounds(m: Metadata, chunk_index: u64) -> (u64, u64, u64) {
     debug_assert!(chunk_index < m.chunks_total());
     let source = m.old_start() + chunk_index * m.chunk_size();
     let destination = (source as i128 + m.displacement() as i128) as u64;
-    let len = m.chunk_size().min(m.len() - chunk_index * m.chunk_size());
+    let len = m.chunk_size().min(m.partition_len() - chunk_index * m.chunk_size());
     (source, destination, len)
 }
 
@@ -815,7 +815,7 @@ fn resize(
     m: Metadata,
     store: &mut Option<&mut dyn MetaStore>,
 ) -> Result<(), Error> {
-    disk.set_partition(Extent::new(m.target_start(), m.target_start() + m.len())?)?;
+    disk.set_partition(Extent::new(m.target_start(), m.target_start() + m.partition_len())?)?;
     disk.sync()?;
 
     if m.widen_forward() && !m.is_forward() {
