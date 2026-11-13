@@ -74,6 +74,6 @@ API documentation and examples can be generated with `cargo doc --open`.
 recoverable-move is licensed under the
 GNU General Public License, version 2 or (at your option) any later version.
 
-See [COPYING](COPYING) for the complete license text.
+See [LICENSE](LICENSE) for the complete license text.
 
 Copyright (C) 2026 mahdoosh1

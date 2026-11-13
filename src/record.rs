@@ -23,7 +23,7 @@
 //!
 //! let geometry = Geometry::new(100, 60, 12).unwrap();
 //! let record = Record::new(geometry, Placement::After, 6, 2, [7; 16]).unwrap();
-//! let bytes = record.encode(512);
+//! let bytes = record.encode(512).unwrap();
 //! let decoded = Record::decode(&bytes).unwrap();
 //! assert_eq!(decoded.phase, Phase::Zero);
 //! assert_eq!(decoded.geometry, geometry);
@@ -139,8 +139,18 @@ impl Record {
 
     /// Encode this record into one sector-sized byte buffer, including CRC-32.
     /// `sector_size` must be at least 84 bytes and fit in a `u32`.
-    pub fn encode(&self, sector_size: usize) -> Vec<u8> {
-        let mut buf = vec![0u8; sector_size];
+    pub fn encode(&self, sector_size: usize) -> Result<Vec<u8>> {
+        if sector_size < CRC_OFFSET + 4 {
+            return Err(Error::invalid("sector size must be at least 84 bytes",));
+        }
+        let encoded_size = u32::try_from(sector_size)
+            .map_err(|_| Error::invalid("sector size exceeds u32::MAX"))?;
+
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(sector_size)
+            .map_err(|e| Error::invalid(format!("record allocation failed: {e}")))?;
+        buf.resize(sector_size, 0);
+
         buf[0..8].copy_from_slice(&MAGIC);
         buf[8..10].copy_from_slice(&VERSION.to_le_bytes());
         buf[10..14].copy_from_slice(&(sector_size as u32).to_le_bytes());
@@ -155,7 +165,7 @@ impl Record {
         buf[64..80].copy_from_slice(&self.original_type_guid);
         let crc = crc32(&buf[..CRC_OFFSET]);
         buf[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
-        buf
+        Ok(buf)
     }
 
     /// Decode a record. Returns `None` if the signature, version, size, CRC,
