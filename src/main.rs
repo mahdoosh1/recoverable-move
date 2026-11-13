@@ -69,8 +69,8 @@ fn repl(path: &Path) -> Result<(), String> {
     println!("This program comes with ABSOLUTELY NO WARRANTY.");
     println!("This is free software, and you are welcome to redistribute it");
     println!("under certain conditions.");
-    println!("")
-    println!("See COPYING for the license terms.");
+    println!("");
+    println!("See LICENSE for the license terms.");
 
     println!("disk: {}", path.display());
     print_help();
