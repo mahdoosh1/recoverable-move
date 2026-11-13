@@ -44,3 +44,9 @@ jobs:
 
       - name: Release build
         run: cargo build --release
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: recoverable-move-linux-x86_64
+          path: target/release/recoverable-move
