@@ -15,7 +15,6 @@
 //! You should have received a copy of the GNU General Public License
 //! along with recoverable-move. If not, see <https://www.gnu.org/licenses/>.
 
-
 //! Crash-recoverable relocation of an overlapping GPT partition.
 //!
 //! A partition occupies `[A, A + L)` and is moved to `[A + X, A + X + L)` with
@@ -74,7 +73,7 @@ pub mod traits;
 
 pub use geometry::{Geometry, Placement};
 pub use gpt_disk::GptDisk;
-pub use mover::{execute, MoveRequest, Verify};
+pub use mover::{MoveRequest, Verify, execute};
 pub use record::{Phase, Record};
 pub use traits::{Disk, Partition, RecordStore};
 
@@ -83,8 +82,7 @@ pub use traits::{Disk, Partition, RecordStore};
 /// The marker lets [`execute`] distinguish an interrupted move from an ordinary
 /// partition and trigger on-disk record recovery.
 pub const MARKER_TYPE_GUID: [u8; 16] = [
-    0x52, 0x4D, 0x56, 0x2D, 0x52, 0x45, 0x43, 0x4F, 0x56, 0x45, 0x52, 0x41, 0x42, 0x4C, 0x45,
-    0x01,
+    0x52, 0x4D, 0x56, 0x2D, 0x52, 0x45, 0x43, 0x4F, 0x56, 0x45, 0x52, 0x41, 0x42, 0x4C, 0x45, 0x01,
 ];
 
 /// Errors returned by geometry validation, disk I/O, record handling, or recovery.

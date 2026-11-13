@@ -15,7 +15,6 @@
 // You should have received a copy of the GNU General Public License
 // along with recoverable-move. If not, see <https://www.gnu.org/licenses/>.
 
-
 //! Versioned, checksummed on-disk journal records used for crash recovery.
 //!
 //! ```
@@ -141,7 +140,7 @@ impl Record {
     /// `sector_size` must be at least 84 bytes and fit in a `u32`.
     pub fn encode(&self, sector_size: usize) -> Result<Vec<u8>, Error> {
         if sector_size < CRC_OFFSET + 4 {
-            return Err(Error::invalid("sector size must be at least 84 bytes",));
+            return Err(Error::invalid("sector size must be at least 84 bytes"));
         }
         let _encoded_size = u32::try_from(sector_size)
             .map_err(|_| Error::invalid("sector size exceeds u32::MAX"))?;

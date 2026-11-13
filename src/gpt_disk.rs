@@ -15,7 +15,6 @@
 // You should have received a copy of the GNU General Public License
 // along with recoverable-move. If not, see <https://www.gnu.org/licenses/>.
 
-
 //! `Disk` implementation backed by a seekable file and a GPT parsed by
 //! [`gptman`]. This works with regular disk-image files as well as block-device
 //! files opened with read/write permissions.
@@ -30,8 +29,8 @@ use std::path::Path;
 
 use gptman::{GPT, GPTPartitionEntry};
 
-use crate::traits::{Disk, Partition};
 use crate::Error;
+use crate::traits::{Disk, Partition};
 
 /// A disk image or block device whose partition table is managed by gptman.
 ///
@@ -64,7 +63,12 @@ impl GptDisk {
         if gpt[partition_number].is_unused() {
             return Err(Error::invalid("selected GPT entry is unused"));
         }
-        Ok(Self { file, gpt, partition_number, sector_size })
+        Ok(Self {
+            file,
+            gpt,
+            partition_number,
+            sector_size,
+        })
     }
 
     /// Borrow the parsed GPT for inspection.
@@ -129,7 +133,9 @@ impl Disk for GptDisk {
 
     fn partition(&mut self) -> Result<Partition, Error> {
         let entry = self.entry();
-        let len = entry.ending_lba.checked_sub(entry.starting_lba)
+        let len = entry
+            .ending_lba
+            .checked_sub(entry.starting_lba)
             .and_then(|n| n.checked_add(1))
             .ok_or_else(|| Error::table("selected partition has an invalid extent"))?;
         Ok(Partition {
@@ -143,7 +149,8 @@ impl Disk for GptDisk {
         if len == 0 {
             return Err(Error::invalid("partition length is zero"));
         }
-        let end = start.checked_add(len - 1)
+        let end = start
+            .checked_add(len - 1)
             .ok_or_else(|| Error::invalid("partition end overflows"))?;
         self.entry_mut().starting_lba = start;
         self.entry_mut().ending_lba = end;

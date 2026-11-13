@@ -15,7 +15,6 @@
 // You should have received a copy of the GNU General Public License
 // along with recoverable-move. If not, see <https://www.gnu.org/licenses/>.
 
-
 //! Storage abstraction and optional durable record mirrors.
 //!
 //! Implement [`Disk`] to use the mover with another storage backend. Implement

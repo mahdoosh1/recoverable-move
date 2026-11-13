@@ -15,14 +15,13 @@
 // You should have received a copy of the GNU General Public License
 // along with recoverable-move. If not, see <https://www.gnu.org/licenses/>.
 
-
 //! Crash-safe state machine that relocates overlapping partition extents.
 //!
 //! Chunks are processed in a direction-dependent order. Each chunk uses sentinel
 //! checkpoint sectors so a restart can distinguish copied data from unfinished
 //! subchunks without requiring a second full-sized journal.
 
-use crate::record::{Phase, Record, RECORD_SECTORS};
+use crate::record::{Phase, RECORD_SECTORS, Record};
 use crate::traits::{Disk, RecordStore};
 use crate::{Error, Geometry, MARKER_TYPE_GUID, Placement};
 
@@ -133,14 +132,24 @@ fn start(
     if request.chunk_size == 0 || request.subchunk_size == 0 {
         return Err(Error::invalid("chunk and subchunk sizes must be nonzero"));
     }
-    let chunk_size = request.chunk_size.min(geometry.displacement().unsigned_abs());
+    let chunk_size = request
+        .chunk_size
+        .min(geometry.displacement().unsigned_abs());
     let subchunk_size = request.subchunk_size.min(chunk_size);
     let partition = disk.partition()?;
     if partition.start != geometry.old_start() || partition.len != geometry.len() {
-        return Err(Error::invalid("the partition is not where the request says it is"));
+        return Err(Error::invalid(
+            "the partition is not where the request says it is",
+        ));
     }
     let placement = choose_placement(disk, geometry)?;
-    let record = Record::new(geometry, placement, chunk_size, subchunk_size, partition.type_guid)?;
+    let record = Record::new(
+        geometry,
+        placement,
+        chunk_size,
+        subchunk_size,
+        partition.type_guid,
+    )?;
 
     write_record(disk, &mut store, &record)?;
     disk.set_type_guid(MARKER_TYPE_GUID)?;
@@ -157,7 +166,11 @@ fn choose_placement(disk: &mut dyn Disk, geometry: Geometry) -> Result<Placement
     // directly discoverable if a crash occurs after the final GPT resize but
     // before the marker GUID is restored. During the earlier source-extent
     // window recovery probes outward by at most the displacement.
-    let preferred = if geometry.is_forward() { Placement::After } else { Placement::Before };
+    let preferred = if geometry.is_forward() {
+        Placement::After
+    } else {
+        Placement::Before
+    };
     let (start, _) = geometry.record_range(preferred)?;
     if disk.range_is_free(start, RECORD_SECTORS)? {
         Ok(preferred)
@@ -189,8 +202,7 @@ fn recover_record(
                     // the on-disk record is persisted before the mirror.
                     // Locate the primary journal using the mirror's geometry
                     // and prefer a valid on-disk record if one exists.
-                    let (record_start, _) =
-                        record.geometry.record_range(record.placement)?;
+                    let (record_start, _) = record.geometry.record_range(record.placement)?;
 
                     if let Some(disk_record) =
                         read_record_at(disk, record_start, sector, &partition)?
@@ -233,7 +245,6 @@ fn recover_record(
         "the partition is marked as in motion but no valid record was found",
     ))
 }
-
 
 /// Read both mirror sectors at one possible record location. An unreadable
 /// mirror is ignored so the other copy can still be used.
@@ -286,7 +297,6 @@ fn run(
     mut record: Record,
     verify: Verify,
 ) -> Result<(), Error> {
-
     if record.phase != Phase::Resize {
         ensure_widened(disk, &record)?;
     }
@@ -348,7 +358,9 @@ fn ensure_widened(disk: &mut dyn Disk, record: &Record) -> Result<(), Error> {
         let source_start = record.geometry.old_start();
         let source_end = source_start + record.geometry.len();
         if partition.start != source_start || partition.end() != source_end {
-            return Err(Error::corrupt("the partition is neither widened nor at its source"));
+            return Err(Error::corrupt(
+                "the partition is neither widened nor at its source",
+            ));
         }
         disk.set_partition(start, end - start)?;
         disk.sync()?;
@@ -452,7 +464,10 @@ fn copy_chunk(disk: &mut dyn Disk, record: &Record, index: u64) -> Result<(), Er
     }
 
     // closest checkpoint after or at offset
-    let mut next_checkpoint = checkpoints.iter().position(|&c| c >= offset).unwrap_or(checkpoints.len());
+    let mut next_checkpoint = checkpoints
+        .iter()
+        .position(|&c| c >= offset)
+        .unwrap_or(checkpoints.len());
     while offset < len {
         if checkpoints.get(next_checkpoint) == Some(&offset) {
             // if offset is checkpoint, we write the sentinel instead
@@ -482,7 +497,12 @@ fn finalize_chunk(disk: &mut dyn Disk, record: &Record, index: u64) -> Result<()
 }
 
 /// Compare destination sectors with their source according to the requested policy.
-fn verify_chunk(disk: &mut dyn Disk, record: &Record, index: u64, verify: Verify) -> Result<(), Error> {
+fn verify_chunk(
+    disk: &mut dyn Disk,
+    record: &Record,
+    index: u64,
+    verify: Verify,
+) -> Result<(), Error> {
     if verify == Verify::None {
         return Ok(());
     }

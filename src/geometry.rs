@@ -15,7 +15,6 @@
 // You should have received a copy of the GNU General Public License
 // along with recoverable-move. If not, see <https://www.gnu.org/licenses/>.
 
-
 //! Checked arithmetic and address calculations for an overlapping partition move.
 //! All extents use half-open LBA ranges: the start is included and the end excluded.
 //!
@@ -67,7 +66,7 @@ pub struct Geometry {
     /// Partition length in sectors.
     len: u64,
     /// Signed difference between target and original start LBAs.
-    displacement: i64
+    displacement: i64,
 }
 
 impl Geometry {

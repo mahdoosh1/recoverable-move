@@ -15,7 +15,6 @@
 // You should have received a copy of the GNU General Public License
 // along with recoverable-move. If not, see <https://www.gnu.org/licenses/>.
 
-
 //! Fault-injection integration tests for crash-safe move and recovery behaviour.
 //! The mock disk counts operations and can fail before/after writes, tear writes,
 //! or corrupt written data to exercise every persisted state transition.
@@ -54,12 +53,15 @@ impl MockDisk {
     fn filled(sectors: u64) -> Self {
         let mut data = vec![0u8; sectors as usize * SECTOR];
         for i in 0..data.len() / SECTOR {
-            data[i * SECTOR..(i + 1) * SECTOR]
-                .fill((i as u8).wrapping_mul(37).wrapping_add(11));
+            data[i * SECTOR..(i + 1) * SECTOR].fill((i as u8).wrapping_mul(37).wrapping_add(11));
         }
         Self {
             data,
-            partition: Partition { start: OLD, len: LEN, type_guid: ORIGINAL_GUID },
+            partition: Partition {
+                start: OLD,
+                len: LEN,
+                type_guid: ORIGINAL_GUID,
+            },
             ops: 0,
             faults: Faults::default(),
         }
@@ -164,14 +166,24 @@ impl Disk for MockDisk {
 
 /// Build the common test request with configurable target and verification mode.
 fn request(new_start: u64, verify: Verify) -> MoveRequest {
-    MoveRequest { old_start: OLD, new_start, len: LEN, chunk_size: CHUNK, subchunk_size: SUB, verify }
+    MoveRequest {
+        old_start: OLD,
+        new_start,
+        len: LEN,
+        chunk_size: CHUNK,
+        subchunk_size: SUB,
+        verify,
+    }
 }
 
 /// Assert that the partition reached the target extent with original contents/GUID.
 fn moved(disk: &MockDisk, new_start: u64, expected: &[u8]) {
     assert_eq!(disk.partition.start, new_start, "partition start");
     assert_eq!(disk.partition.len, LEN, "partition length");
-    assert_eq!(disk.partition.type_guid, ORIGINAL_GUID, "type GUID restored");
+    assert_eq!(
+        disk.partition.type_guid, ORIGINAL_GUID,
+        "type GUID restored"
+    );
     assert_eq!(disk.region(new_start, LEN), expected, "partition contents");
 }
 
@@ -331,7 +343,10 @@ fn zero_displacement_is_invalid() {
 /// Ensure recovery reports no record when no move is active.
 fn a_clean_disk_has_nothing_to_recover() {
     let mut disk = MockDisk::filled(4096);
-    assert!(matches!(execute(&mut disk, None, None), Err(Error::NoRecord)));
+    assert!(matches!(
+        execute(&mut disk, None, None),
+        Err(Error::NoRecord)
+    ));
 }
 
 #[test]

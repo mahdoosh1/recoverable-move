@@ -15,7 +15,6 @@
 // You should have received a copy of the GNU General Public License
 // along with recoverable-move. If not, see <https://www.gnu.org/licenses/>.
 
-
 //! Interactive CLI for the recoverable-move library.
 //!
 //! The program accepts an optional disk image/device path, then offers commands
@@ -30,7 +29,7 @@ use std::process;
 
 use gptman::GPT;
 use recoverable_move::traits::{FileStore, RecordStore};
-use recoverable_move::{execute, Disk, GptDisk, MoveRequest, Verify};
+use recoverable_move::{Disk, GptDisk, MoveRequest, Verify, execute};
 
 /// Parse the optional disk path and start the command loop.
 fn main() {
@@ -62,7 +61,6 @@ fn main() {
 
 /// Run the interactive command prompt for the selected disk.
 fn repl(path: &Path) -> Result<(), String> {
-
     println!("recoverable-move");
     println!("Copyright (C) 2026 mahdoosh1");
     println!();
@@ -173,9 +171,7 @@ fn cmd_verify(path: &Path) -> Result<(), String> {
             gpt.header.crc32_checksum
         ));
     }
-    let entries_crc = gpt
-        .header
-        .generate_partition_entry_array_crc32(&entries);
+    let entries_crc = gpt.header.generate_partition_entry_array_crc32(&entries);
     if entries_crc != gpt.header.partition_entry_array_crc32 {
         return Err(format!(
             "partition-array CRC mismatch: stored {:#010x}, computed {entries_crc:#010x}",
@@ -237,7 +233,9 @@ fn cmd_move(path: &Path) -> Result<(), String> {
     println!("  subchunk {subchunk} sectors");
     println!(
         "  metadata mirror: {}",
-        store_path.as_ref().map_or_else(|| "(none)".into(), |p| p.display().to_string())
+        store_path
+            .as_ref()
+            .map_or_else(|| "(none)".into(), |p| p.display().to_string())
     );
     if store_path.is_none() {
         eprintln!("warning: no metadata mirror; recovery relies on the on-disk record");
@@ -247,8 +245,7 @@ fn cmd_move(path: &Path) -> Result<(), String> {
     }
 
     let mut store = store_path.map(FileStore::new);
-    let store_ref: Option<&mut dyn RecordStore> =
-        store.as_mut().map(|s| s as &mut dyn RecordStore);
+    let store_ref: Option<&mut dyn RecordStore> = store.as_mut().map(|s| s as &mut dyn RecordStore);
     let request = MoveRequest {
         old_start,
         new_start,
@@ -274,8 +271,7 @@ fn cmd_recover(path: &Path) -> Result<(), String> {
     } else {
         Some(FileStore::new(PathBuf::from(store_input.trim())))
     };
-    let store_ref: Option<&mut dyn RecordStore> =
-        store.as_mut().map(|s| s as &mut dyn RecordStore);
+    let store_ref: Option<&mut dyn RecordStore> = store.as_mut().map(|s| s as &mut dyn RecordStore);
     let mut disk = GptDisk::open(path, index).map_err(|e| e.to_string())?;
     execute(&mut disk, store_ref, None).map_err(|e| format!("recovery failed: {e}"))?;
     println!("\nrecovery complete\n");
@@ -313,7 +309,11 @@ fn prompt_optional<T: std::str::FromStr>(message: &str) -> Result<Option<T>, Str
     if input.trim().is_empty() {
         return Ok(None);
     }
-    input.trim().parse::<T>().map(Some).map_err(|_| "invalid value".into())
+    input
+        .trim()
+        .parse::<T>()
+        .map(Some)
+        .map_err(|_| "invalid value".into())
 }
 
 /// Ask for explicit yes/no confirmation; all answers except yes are false.
@@ -321,7 +321,11 @@ fn confirm(message: &str) -> bool {
     print!("{message} [y/N] ");
     let _ = io::stdout().flush();
     matches!(
-        prompt_line("").unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+        prompt_line("")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
         "y" | "yes"
     )
 }
@@ -330,7 +334,21 @@ fn confirm(message: &str) -> bool {
 fn format_guid(guid: &[u8; 16]) -> String {
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        guid[3], guid[2], guid[1], guid[0], guid[5], guid[4], guid[7], guid[6],
-        guid[8], guid[9], guid[10], guid[11], guid[12], guid[13], guid[14], guid[15]
+        guid[3],
+        guid[2],
+        guid[1],
+        guid[0],
+        guid[5],
+        guid[4],
+        guid[7],
+        guid[6],
+        guid[8],
+        guid[9],
+        guid[10],
+        guid[11],
+        guid[12],
+        guid[13],
+        guid[14],
+        guid[15]
     )
 }
