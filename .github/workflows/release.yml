@@ -37,7 +37,6 @@ jobs:
           mkdir -p dist
           cp target/release/recoverable-move dist/recoverable-move-linux-x86_64
           cd dist
-          sha256sum recoverable-move-linux-x86_64 > SHA256SUMS
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
@@ -45,4 +44,3 @@ jobs:
           generate_release_notes: true
           files: |
             dist/recoverable-move-linux-x86_64
-            dist/SHA256SUMS
