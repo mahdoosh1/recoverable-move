@@ -13,7 +13,7 @@ written in Rust; the binary provides an interactive GPT command-line interface.
 > [!WARNING]
 > **NOTE**
 >
-> THIS PROJECT IS VIBE CODED BY DEEPSEEK AND CHATGPT AND ME (mahdoosh1).
+> THIS PROJECT IS VIBE CODED BY DEEPSEEK AND CHATGPT AND, ME (mahdoosh1),
 > THE AUTHOR HAVE READ IT AND VERIFIED IT.
 
 ## Build and test
