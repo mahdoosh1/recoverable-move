@@ -79,7 +79,7 @@ API documentation and examples can be generated with `cargo doc --open`.
 ## License
 
 recoverable-move is licensed under the
-GNU General Public License, version 2 or (at your option) any later version.
+GNU General Public License, version 2.
 
 See [LICENSE](LICENSE) for the complete license text.
 
