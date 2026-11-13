@@ -3,11 +3,18 @@
 Crash-recoverable relocation of an overlapping GPT partition. The library is
 written in Rust; the binary provides an interactive GPT command-line interface.
 
-> **Destructive storage operations.** This program writes raw sectors and GPT
-> metadata. Back up the disk, unmount the target partition, ensure nothing is
-> accessing it, and test using a disposable disk image before using a real device.
+> [!WARNING]
+> **Destructive storage operations**
+>
+> This program writes raw sectors and GPT metadata. Back up the disk,
+> unmount the target partition, ensure nothing is accessing it, and
+> test using a disposable disk image before using a real device.
 
-NOTE: THIS PROJECT IS VIBE CODED BY DEEPSEEK AND CHATGPT AND ME (mahdoosh1) THE AUTHOR HAVE READ IT AND VERIFIED IT.
+> [!WARNING]
+> **NOTE**
+>
+> THIS PROJECT IS VIBE CODED BY DEEPSEEK AND CHATGPT AND ME (mahdoosh1).
+> THE AUTHOR HAVE READ IT AND VERIFIED IT.
 
 ## Build and test
 
