@@ -171,7 +171,6 @@ fn choose_placement(disk: &mut dyn Disk, geometry: Geometry) -> Result<Placement
 /// Find the record of a marked partition. It is adjacent to the widened
 /// extent during the move and adjacent to the final extent after the last
 /// resize; the bounded fallback handles the brief original-extent window.
-
 fn recover_record(
     disk: &mut dyn Disk,
     store: &mut Option<&mut dyn RecordStore>,

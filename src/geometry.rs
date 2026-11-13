@@ -112,6 +112,7 @@ impl Geometry {
     }
 
     /// Return the partition length in sectors.
+    #[allow(clippy::len_without_is_empty)]
     pub const fn len(self) -> u64 {
         self.len
     }
