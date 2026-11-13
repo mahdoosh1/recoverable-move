@@ -7,7 +7,8 @@ The library treats partition contents as opaque. It does not know or care
 what filesystem lives inside. It only needs a `Disk` that can read and
 write sectors and read/update a partition extent.
 
-NOTE: Vibe-coded with deepseek, i will debloat it sometime
+NOTE: originally vibe-coded; since refactored for readability, robustness,
+and accurate docs.
 
 ## The problem
 
@@ -29,10 +30,11 @@ A crash at *any* instruction is recoverable, because:
   carries a checksum, so a torn write is detected and the record is
   discarded.
 
-- **A `MetaStore` mirror** is written *before* the sector. This is
-  load-bearing: by the end of the move the metadata sector has been
-  overwritten by moved data, so on-disk recovery alone cannot find the
-  final resize. The mirror is how recovery survives that phase.
+- **A `MetaStore` mirror** is written *before* the sector. By the end
+  of the move the metadata sector has been overwritten by moved data, so
+  on-disk recovery alone cannot find the final resize. The mirror is how
+  recovery survives that phase. The store is also written before the
+  initial widen, so a crash there resumes cleanly.
 
 - **Checkpoints** in the destination record in-chunk progress. Each
   subchunk ends in a one-sector checkpoint that is (a) zeroed before the
@@ -52,8 +54,9 @@ E = max(A+L, A+X+L)
 
 The enlarged partition is either `[U-1, E)` — metadata in free space
 behind the union — or `[U, E+1)` — metadata at `U`, with the sector at
-`E` doubling as a **shadow**. `uses_shadow` in `MoveParams` picks between
-the two; the caller decides based on whether `U-1` is free.
+`E` doubling as a **shadow**. The mover picks between the two at start:
+it widens backward when `U-1` is free, otherwise forward, failing if
+neither sector is available.
 
 The shadow's role depends on direction:
 
@@ -106,35 +109,47 @@ subchunks per chunk. That's `N = 262144`, so overhead ≈ 0.0008%.
 ## Usage
 
 ```rust
-use recoverable_move::{
-    run, Disk, Error, FileStore, Gpt, MoveParams, SECTOR_SIZE,
-};
-use std::path::PathBuf;
+use recoverable_move::{execute, traits::{Disk, FileStore, MetaStore}, MoveRequest};
 
-let mut disk = MyDisk::open("/dev/sdX")?;
-let mut store = FileStore::new(PathBuf::from("/var/lib/movepart/meta.bin"));
+let mut disk: MyDisk = MyDisk::open("/dev/sdX")?;
+let mut store = FileStore::new("/var/lib/movepart/meta.bin");
 
-let params = MoveParams {
-    old_start: 2048,
-    len: 1_048_576,
-    new_start: 1_000_000,
-    chunk_size: 32 * 1024 * 1024 * 1024 / SECTOR_SIZE as u64,
-    subchunk_size: 128 * 1024 * 1024 / SECTOR_SIZE as u64,
-    uses_shadow: false,
-};
+let request = MoveRequest::new(
+    2048,      // old_start
+    1_048_576, // len
+    1_000_000, // new_start
+    67_108_864, // chunk sectors (≤ |displacement|)
+    262_144,    // subchunk sectors
+)?;
 
-run(&mut disk, Some(params), &mut store)?;
+execute(&mut disk, Some(request), Some(&mut store))?;
 ```
 
-To resume an interrupted move, call with `params = None`:
+To resume an interrupted move, pass `None` for the request:
 
 ```rust
-run(&mut disk, None, &mut store)?;
+use recoverable_move::traits::MetaStore;
+let store_ref: Option<&mut dyn MetaStore> = Some(&mut store);
+execute(&mut disk, None, store_ref)?;
 ```
 
 If metadata is present it resumes; if not, `Error::NoTransaction` is
-returned. Passing `Some(params)` after a partial move is ignored — the
-stored metadata wins.
+returned. Passing `Some(request)` after a partial move is ignored — the
+stored metadata wins. The store is optional: with `None` the on-disk
+metadata sector is the only record, which is enough except for a crash
+inside the resize phase.
+
+### Interactive CLI
+
+The crate ships a `recoverable-move` binary for working on disk images:
+
+```sh
+cargo run -- /path/to/image.img
+```
+
+Commands: `list`, `verify` (GPT CRCs), `move`, `recover`, and `help`.
+Release builds omit the unsafe `set` command, which rewrites a partition
+entry without moving data.
 
 ### Implementing `Disk`
 
@@ -143,28 +158,34 @@ pub trait Disk {
     fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Error>;
     fn write_sector(&mut self, lba: u64, buf: &[u8]) -> Result<(), Error>;
     fn sync(&mut self) -> Result<(), Error>;
-    fn get_partition(&mut self) -> Result<Gpt, Error>;
-    fn set_partition(&mut self, gpt: Gpt) -> Result<(), Error>;
+    fn get_partition(&mut self) -> Result<Extent, Error>;
+    fn set_partition(&mut self, extent: Extent) -> Result<(), Error>;
+    fn is_sector_free(&mut self, lba: u64) -> Result<bool, Error>;
+    fn is_range_free(&mut self, start: u64, end: u64) -> Result<bool, Error>;
 }
 ```
 
 `get_partition` / `set_partition` operate on the moved partition only.
-The caller is responsible for whatever the platform requires to keep the
-primary and backup GPT consistent; the library treats the extent as one
-logical object.
+Free-space queries are used to choose where the metadata sector goes and
+to reject a target that overlaps another partition. `FileDisk` in
+[`src/disk.rs`](src/disk.rs) implements all of this on top of a file or
+block device, keeping the primary and backup GPT in sync via
+[`src/gpt.rs`](src/gpt.rs).
 
 ## MetaStore
 
-The metadata mirror is part of the protocol, not an optional aid. Three
-implementations ship:
+The mirror strengthens recovery; it is not strictly required for most
+phases. Two implementations ship:
 
 - **`FileStore`** — durable, uses `fsync`. Production.
 - **`MemStore`** — in-memory. Tests.
-- **`NullStore`** — discards writes. Only if the resize phase is known
-  not to be interruptible (e.g. battery-backed write cache).
 
-A crash inside `Resize` without a working store is unrecoverable by
-design.
+Without a store, the mover still recovers from the on-disk metadata
+sector across every phase except a crash inside `Resize`, where the
+metadata sector has been overwritten. A crash inside `Resize` without a
+working store is unrecoverable by design. With a store, `start` writes
+the record before widening the partition, so even a crash in that
+window resumes cleanly.
 
 ## Invariants
 
@@ -188,8 +209,10 @@ design.
 - `is_sentinel` treats any all-`0xA5` sector at a checkpoint position as
   a sentinel. A payload that happens to match costs one redundant
   rewrite, not correctness.
-- The resize-to-cleanup window inside `do_resize` is only recoverable
-  via the `MetaStore`. See above.
+- The resize-to-cleanup window inside `resize` is only recoverable via
+  the `MetaStore`. See above.
+- A crash before the partition is widened is recoverable only with a
+  `MetaStore`; without one there is no on-disk record yet.
 
 ## Testing
 

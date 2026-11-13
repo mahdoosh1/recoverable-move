@@ -12,6 +12,8 @@ pub const DEFAULT_SECTOR_SIZE: u64 = 512;
 pub const GPT_HEADER_MIN_SIZE: u32 = 92;
 pub const GPT_ENTRY_MIN_SIZE: u32 = 128;
 pub const GPT_NAME_LEN: usize = 36;
+/// Generous upper bound on the entry array; real tables are a few KiB.
+pub const MAX_ENTRY_ARRAY_BYTES: u64 = 4 * 1024 * 1024;
 
 // --- CRC32 -------------------------------------------------------------
 
@@ -53,7 +55,9 @@ pub enum Error {
     Io(io::Error),
     InvalidSignature { found: u64 },
     HeaderTooSmall { found: u32 },
+    HeaderTooLarge { found: u32, sector_size: u64 },
     EntryTooSmall { found: u32 },
+    EntryArrayTooLarge { found: u64 },
     Overflow,
     CrcMismatch {
         what: &'static str,
@@ -80,8 +84,14 @@ impl fmt::Display for Error {
             Self::HeaderTooSmall { found } => {
                 write!(f, "GPT header size too small: {found}")
             }
+            Self::HeaderTooLarge { found, sector_size } => {
+                write!(f, "GPT header size {found} exceeds sector size {sector_size}")
+            }
             Self::EntryTooSmall { found } => {
                 write!(f, "GPT entry size too small: {found}")
+            }
+            Self::EntryArrayTooLarge { found } => {
+                write!(f, "GPT entry array too large: {found} bytes")
             }
             Self::Overflow => f.write_str("size overflow while reading GPT"),
             Self::CrcMismatch { what, expected, computed } => write!(
@@ -204,9 +214,23 @@ impl Gpt {
         if header.header_size < GPT_HEADER_MIN_SIZE {
             return Err(Error::HeaderTooSmall { found: header.header_size });
         }
+        if header.header_size as u64 > sector_size {
+            return Err(Error::HeaderTooLarge {
+                found: header.header_size,
+                sector_size,
+            });
+        }
         if header.size_of_partition_entry < GPT_ENTRY_MIN_SIZE {
             return Err(Error::EntryTooSmall {
                 found: header.size_of_partition_entry,
+            });
+        }
+        if header.first_usable_lba > header.last_usable_lba {
+            return Err(Error::OutOfUsableRange {
+                start: header.first_usable_lba,
+                end: header.last_usable_lba,
+                first: header.first_usable_lba,
+                last: header.last_usable_lba,
             });
         }
 
@@ -219,6 +243,12 @@ impl Gpt {
             .partition_entry_lba
             .checked_mul(sector_size)
             .ok_or(Error::Overflow)?;
+        array_offset
+            .checked_add(array_bytes)
+            .ok_or(Error::Overflow)?;
+        if array_bytes > MAX_ENTRY_ARRAY_BYTES {
+            return Err(Error::EntryArrayTooLarge { found: array_bytes });
+        }
 
         let mut entry_array = vec![0u8; array_bytes as usize];
         read_exact_at(&mut reader, array_offset, &mut entry_array)?;

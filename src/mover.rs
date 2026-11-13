@@ -26,7 +26,6 @@
 //! chunk is fully copied. Recovery reads the checkpoints, finds the last
 //! sentinel, and resumes immediately after it.
 
-use std::collections::HashSet;
 use std::fmt;
 
 use crate::traits::{Disk, MetaStore};
@@ -178,6 +177,49 @@ pub struct Metadata {
     chunks_done: u64,
 }
 
+/// The geometry fields, checked identically by `Metadata::new` and
+/// `Metadata::decode`.
+struct Shape {
+    old_start: u64,
+    len: u64,
+    displacement: i64,
+    chunk_size: u64,
+    subchunk_size: u64,
+    widen_forward: bool,
+}
+
+fn check_shape(s: Shape) -> Result<(), &'static str> {
+    if s.len == 0 {
+        return Err("zero length");
+    }
+    if s.displacement == 0 {
+        return Err("zero displacement");
+    }
+    if s.chunk_size == 0 || s.chunk_size > s.displacement.unsigned_abs() {
+        return Err("chunk size out of range");
+    }
+    if s.subchunk_size == 0 || s.subchunk_size > s.chunk_size {
+        return Err("subchunk size out of range");
+    }
+
+    let target_start = s
+        .old_start
+        .checked_add_signed(s.displacement)
+        .ok_or("target start overflows")?;
+    let source_end = s.old_start.checked_add(s.len).ok_or("source end overflows")?;
+    let target_end = target_start.checked_add(s.len).ok_or("target end overflows")?;
+
+    let union_lower = s.old_start.min(target_start);
+    if !s.widen_forward && union_lower == 0 {
+        return Err("no sector before union");
+    }
+    let union_upper = source_end.max(target_end);
+    if s.widen_forward && union_upper.checked_add(1).is_none() {
+        return Err("union end overflows");
+    }
+    Ok(())
+}
+
 impl Metadata {
     /// Create a fresh metadata record for a new move. Returns an error if
     /// any invariant fails; the caller cannot hold an invalid `Metadata`.
@@ -189,47 +231,15 @@ impl Metadata {
         subchunk_size: u64,
         widen_forward: bool,
     ) -> Result<Self, Error> {
-        if len == 0 {
-            return Err(Error::InvalidParams("zero length".into()));
-        }
-        if displacement == 0 {
-            return Err(Error::InvalidParams("zero displacement".into()));
-        }
-        if old_start.checked_add_signed(displacement).is_none() {
-            return Err(Error::InvalidParams("target start overflows".into()));
-        }
-        if chunk_size == 0 || chunk_size > displacement.unsigned_abs() {
-            return Err(Error::InvalidParams("chunk size out of range".into()));
-        }
-        if subchunk_size == 0 || subchunk_size > chunk_size {
-            return Err(Error::InvalidParams("subchunk size out of range".into()));
-        }
-        if subchunk_size < CHECKPOINT_SECTORS {
-            return Err(Error::InvalidParams(
-                "subchunk smaller than one checkpoint".into(),
-            ));
-        }
-
-        let target_start = old_start
-            .checked_add_signed(displacement)
-            .ok_or_else(|| Error::InvalidParams("target start overflows".into()))?;
-
-        if old_start.checked_add(len).is_none() {
-            return Err(Error::InvalidParams("source end overflows".into()));
-        }
-        if target_start.checked_add(len).is_none() {
-            return Err(Error::InvalidParams("target end overflows".into()));
-        }
-
-        let union_lower = old_start.min(target_start);
-        if !widen_forward && union_lower == 0 {
-            return Err(Error::InvalidParams("no sector before union".into()));
-        }
-
-        let chunks_total = len.div_ceil(chunk_size);
-        if chunks_total == 0 {
-            return Err(Error::InvalidParams("zero chunks".into()));
-        }
+        let shape = Shape {
+            old_start,
+            len,
+            displacement,
+            chunk_size,
+            subchunk_size,
+            widen_forward,
+        };
+        check_shape(shape).map_err(|e| Error::InvalidParams(e.into()))?;
 
         Ok(Self {
             phase: Phase::Init,
@@ -239,7 +249,7 @@ impl Metadata {
             displacement,
             chunk_size,
             subchunk_size,
-            chunks_total,
+            chunks_total: len.div_ceil(chunk_size),
             chunks_done: 0,
         })
     }
@@ -378,39 +388,21 @@ impl Metadata {
     }
 
     fn validate(self) -> Result<(), Error> {
-        if self.len == 0 {
-            return Err(Error::Corrupt("zero length".into()));
-        }
-        if self.displacement == 0 {
-            return Err(Error::Corrupt("zero displacement".into()));
-        }
-        if self.chunk_size == 0 || self.chunk_size > self.displacement.unsigned_abs() {
-            return Err(Error::Corrupt("chunk size out of range".into()));
-        }
-        if self.subchunk_size == 0 || self.subchunk_size > self.chunk_size {
-            return Err(Error::Corrupt("subchunk size out of range".into()));
-        }
-        if self.chunks_total == 0 {
-            return Err(Error::Corrupt("zero chunks".into()));
+        check_shape(Shape {
+            old_start: self.old_start,
+            len: self.len,
+            displacement: self.displacement,
+            chunk_size: self.chunk_size,
+            subchunk_size: self.subchunk_size,
+            widen_forward: self.widen_forward,
+        })
+        .map_err(|e| Error::Corrupt(e.into()))?;
+
+        if self.chunks_total != self.len.div_ceil(self.chunk_size) {
+            return Err(Error::Corrupt("chunk count inconsistent".into()));
         }
         if self.chunks_done > self.chunks_total {
             return Err(Error::Corrupt("chunks done exceeds total".into()));
-        }
-        let expected = self.len.div_ceil(self.chunk_size);
-        if self.chunks_total != expected {
-            return Err(Error::Corrupt("chunk count inconsistent".into()));
-        }
-        if self.old_start.checked_add_signed(self.displacement).is_none() {
-            return Err(Error::Corrupt("target start overflows".into()));
-        }
-        if self.old_start.checked_add(self.len).is_none() {
-            return Err(Error::Corrupt("source end overflows".into()));
-        }
-        if self.target_start().checked_add(self.len).is_none() {
-            return Err(Error::Corrupt("target end overflows".into()));
-        }
-        if !self.widen_forward && self.union_lower() == 0 {
-            return Err(Error::Corrupt("no sector before union".into()));
         }
         Ok(())
     }
@@ -574,10 +566,14 @@ pub fn execute(
     let partition = disk.get_partition()?;
 
     if let Some(metadata) = read_metadata(disk, partition.start(), &mut store)? {
-        if metadata.phase() != Phase::Resize && partition != metadata.partition_range() {
+        let widened = metadata.partition_range();
+        let source = Extent::new(
+            metadata.old_start(),
+            metadata.old_start() + metadata.partition_len(),
+        )?;
+        if metadata.phase() != Phase::Resize && partition != widened && partition != source {
             return Err(Error::Corrupt(format!(
-                "partition extent {partition:?} does not match metadata {expected:?}",
-                expected = metadata.partition_range(),
+                "partition extent {partition:?} does not match metadata {widened:?}",
             )));
         }
         return resume(disk, metadata.metadata_lba(), metadata, &mut store);
@@ -611,11 +607,13 @@ pub fn start(
         ));
     }
 
+    let overflow = || Error::InvalidParams("extent end overflows".into());
+    let old_end = request.old_start.checked_add(request.len).ok_or_else(overflow)?;
+    let new_end = request.new_start.checked_add(request.len).ok_or_else(overflow)?;
     let union_lower = request.old_start.min(request.new_start);
-    let union_upper = (request.old_start + request.len)
-        .max(request.new_start + request.len);
+    let union_upper = old_end.max(new_end);
 
-    if !disk.is_range_free(request.new_start, request.new_start + request.len)? {
+    if !disk.is_range_free(request.new_start, new_end)? {
         return Err(Error::InvalidParams(
             "target range overlaps another partition or is out of bounds".into(),
         ));
@@ -642,15 +640,21 @@ pub fn start(
         widen_forward,
     )?;
 
-    disk.set_partition(metadata.partition_range())?;
-    disk.sync()?;
-
     if metadata.widen_forward() && metadata.is_forward() {
         let mut saved = [0u8; SECTOR_SIZE];
         disk.read_sector(metadata.metadata_lba(), &mut saved)?;
         disk.write_sector(metadata.shadow_lba(), &saved)?;
         disk.sync()?;
     }
+
+    // Persist out-of-band before the partition table changes, so a crash
+    // in the widen window is still resumable.
+    if let Some(s) = store.as_deref_mut() {
+        s.write(&metadata.encode())?;
+    }
+
+    disk.set_partition(metadata.partition_range())?;
+    disk.sync()?;
 
     write_metadata(disk, metadata.metadata_lba(), &metadata, &mut store)?;
     resume(disk, metadata.metadata_lba(), metadata, &mut store)
@@ -667,6 +671,10 @@ fn resume(
     loop {
         match metadata.phase() {
             Phase::Init => {
+                if disk.get_partition()? != metadata.partition_range() {
+                    disk.set_partition(metadata.partition_range())?;
+                    disk.sync()?;
+                }
                 metadata.set_phase(Phase::Zero);
                 write_metadata(disk, metadata_lba, &metadata, store)?;
             }
@@ -740,31 +748,28 @@ fn copy_chunk(
 ) -> Result<(), Error> {
     debug_assert_eq!(m.phase(), Phase::Copy);
     let (source, destination, chunk_len) = chunk_bounds(m, chunk_index);
-    let checkpoints = checkpoint_offsets(chunk_len, m.subchunk_size());
+    let subchunk = m.subchunk_size();
+    let is_checkpoint = |offset: u64| (offset + 1).is_multiple_of(subchunk) || offset == chunk_len - 1;
 
-    let mut resume_offset = 0u64;
     let mut buf = [0u8; SECTOR_SIZE];
-    for &offset in &checkpoints {
+    let mut resume_offset = 0u64;
+    for offset in checkpoint_offsets(chunk_len, subchunk) {
         disk.read_sector(destination_lba(m, destination + offset), &mut buf)?;
-        if is_sentinel(&buf) {
-            resume_offset = offset + 1;
-        } else {
+        if !is_sentinel(&buf) {
             break;
         }
+        resume_offset = offset + 1;
     }
 
-    let checkpoint_set: HashSet<u64> = checkpoints.iter().copied().collect();
     let sentinel = [SENTINEL; SECTOR_SIZE];
     let mut offset = resume_offset;
     while offset < chunk_len {
         let physical_destination = destination_lba(m, destination + offset);
-        if checkpoint_set.contains(&offset) {
+        if is_checkpoint(offset) {
             disk.write_sector(physical_destination, &sentinel)?;
         } else {
-            let physical_source = source_lba(m, source + offset);
-            let mut data = [0u8; SECTOR_SIZE];
-            disk.read_sector(physical_source, &mut data)?;
-            disk.write_sector(physical_destination, &data)?;
+            disk.read_sector(source_lba(m, source + offset), &mut buf)?;
+            disk.write_sector(physical_destination, &buf)?;
         }
         offset += 1;
     }

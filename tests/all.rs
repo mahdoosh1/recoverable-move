@@ -170,6 +170,21 @@ fn checkpoint_offsets_match_subchunk_boundaries() {
 }
 
 #[test]
+fn gpt_rejects_oversized_header() {
+    use recoverable_move::gpt;
+    let mut disk = MockDisk::new(64);
+    disk.partition = Extent::new(1, 2).unwrap();
+    // Fabricate a header whose size exceeds one sector.
+    let mut header = [0u8; 512];
+    header[0..8].copy_from_slice(&gpt::EFI_PTAB_HEADER_ID.to_le_bytes());
+    header[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+    header[12..16].copy_from_slice(&600u32.to_le_bytes());
+    disk.data[512..1024].copy_from_slice(&header);
+    let err = gpt::Gpt::read(std::io::Cursor::new(&disk.data)).unwrap_err();
+    assert!(matches!(err, gpt::Error::HeaderTooLarge { .. }));
+}
+
+#[test]
 fn invalid_metadata_rejected() {
     assert!(Metadata::new(100, 60, 0, 10, 3, false).is_err());
     assert!(Metadata::new(100, 0, 100, 10, 3, false).is_err());
@@ -371,6 +386,38 @@ fn run_after_completion_returns_no_transaction() {
 
     let err = execute(&mut disk, None, None).unwrap_err();
     assert!(matches!(err, Error::NoTransaction));
+}
+
+// --- Widen-window crash (store-backed) --------------------------------
+
+#[test]
+fn store_recovers_crash_before_widen() {
+    let (mut probe, _) = setup_with(None);
+    let _ = execute(&mut probe, Some(request(200)), None);
+    let widen = probe
+        .trace
+        .iter()
+        .position(|op| matches!(op, Op::SetPartition(_)))
+        .map(|i| i as u64 + 1)
+        .expect("baseline never widened");
+
+    let mut store = MemStore::new();
+    let (mut disk, original) = setup_with(None);
+    disk.crash_at = Some(widen);
+    let _ = execute(&mut disk, Some(request(200)), Some(&mut store));
+
+    disk.crash_at = None;
+    execute(&mut disk, None, Some(&mut store)).unwrap();
+    assert_eq!(disk.partition, Extent::new(200, 200 + LEN).unwrap());
+    check_region(&mut disk, 200, &original);
+}
+
+#[test]
+fn overflowing_extent_rejected() {
+    let (mut disk, _) = setup_with(None);
+    let req = MoveRequest::new(OLD, u64::MAX, OLD + 1, 1, 1).unwrap();
+    let err = execute(&mut disk, Some(req), None).unwrap_err();
+    assert!(matches!(err, Error::InvalidParams(_)));
 }
 
 // --- Mock disk ---------------------------------------------------------

@@ -28,6 +28,8 @@
 //! # Entry points
 //!
 //! - [`mover::execute`] — start a new move or resume an interrupted one.
+//!   With a [`traits::MetaStore`] the record is persisted before the
+//!   partition is widened, so every crash point is resumable.
 //! - [`mover::MoveRequest`] — parameters for a new move.
 //! - [`traits::Disk`] — raw sector I/O plus partition-table access.
 //! - [`traits::MetaStore`] — durable out-of-band record of move progress.

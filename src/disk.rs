@@ -33,20 +33,21 @@ impl FileDisk {
         self.partition_index
     }
 
-    fn offset(lba: u64) -> u64 {
-        lba * SECTOR_SIZE as u64
+    fn offset(lba: u64) -> Result<u64, Error> {
+        lba.checked_mul(SECTOR_SIZE as u64)
+            .ok_or_else(|| Error::InvalidParams(format!("LBA {lba} overflows the disk offset")))
     }
 }
 
 impl Disk for FileDisk {
     fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Error> {
-        self.file.seek(SeekFrom::Start(Self::offset(lba)))?;
+        self.file.seek(SeekFrom::Start(Self::offset(lba)?))?;
         self.file.read_exact(buf)?;
         Ok(())
     }
 
     fn write_sector(&mut self, lba: u64, buf: &[u8]) -> Result<(), Error> {
-        self.file.seek(SeekFrom::Start(Self::offset(lba)))?;
+        self.file.seek(SeekFrom::Start(Self::offset(lba)?))?;
         self.file.write_all(buf)?;
         Ok(())
     }
