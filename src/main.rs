@@ -1,155 +1,220 @@
+// Copyright (C) 2026 mahdoosh1
+//
+// This file is part of recoverable-move.
+//
+// recoverable-move is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 2 of the License, or
+// (at your option) any later version.
+//
+// recoverable-move is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+// See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with recoverable-move. If not, see <https://www.gnu.org/licenses/>.
+
+
 //! Interactive CLI for the recoverable-move library.
+//!
+//! The program accepts an optional disk image/device path, then offers commands
+//! to list and verify GPT metadata, move a partition, or recover an interrupted
+//! move. Operations that modify storage require explicit confirmation.
 
 use std::env;
-use std::fs::OpenOptions;
-use std::io::{self, BufRead, Write};
+use std::fs::File;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
-use recoverable_move::disk::FileDisk;
-use recoverable_move::gpt;
-use recoverable_move::mover::{self, MoveRequest};
-use recoverable_move::traits::{Disk, FileStore, MetaStore};
+use gptman::GPT;
+use recoverable_move::traits::{FileStore, RecordStore};
+use recoverable_move::{execute, Disk, GptDisk, MoveRequest, Verify};
 
+/// Parse the optional disk path and start the command loop.
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    let path = if args.len() >= 2 {
-        PathBuf::from(&args[1])
-    } else {
-        match prompt_line("Disk image: ") {
+    let mut args = env::args_os().skip(1);
+    let path = match args.next() {
+        Some(arg) => PathBuf::from(arg),
+        None => match prompt_line("Disk image/device: ") {
             Ok(s) if !s.trim().is_empty() => PathBuf::from(s.trim()),
             _ => {
-                eprintln!("no image given");
+                eprintln!("no disk image/device given");
                 process::exit(2);
             }
-        }
+        },
     };
 
+    if args.next().is_some() {
+        eprintln!("usage: recoverable-move [DISK_IMAGE_OR_DEVICE]");
+        process::exit(2);
+    }
     if !path.exists() {
         eprintln!("no such file: {}", path.display());
         process::exit(2);
     }
-
-    if let Err(e) = repl(&path) {
-        eprintln!("error: {e}");
+    if let Err(error) = repl(&path) {
+        eprintln!("error: {error}");
         process::exit(1);
     }
 }
 
+/// Run the interactive command prompt for the selected disk.
 fn repl(path: &Path) -> Result<(), String> {
-    println!("recoverable-move — interactive GPT tool");
-    println!("image: {}", path.display());
-    println!();
-    print_repl_help();
-    println!();
 
-    if let Err(e) = cmd_list(path) {
-        eprintln!("warning: {e}");
+    println!("recoverable-move");
+    println!("Copyright (C) 2026 mahdoosh1");
+    println!("");
+    println!("This program comes with ABSOLUTELY NO WARRANTY.");
+    println!("This is free software, and you are welcome to redistribute it");
+    println!("under certain conditions.");
+    println!("")
+    println!("See COPYING for the license terms.");
+
+    println!("disk: {}", path.display());
+    print_help();
+    if let Err(error) = cmd_list(path) {
+        eprintln!("warning: {error}");
     }
 
     loop {
         print!("\n> ");
         io::stdout().flush().ok();
         let line = match prompt_line("") {
-            Ok(l) => l,
+            Ok(line) => line,
             Err(_) => break,
         };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let mut parts = line.split_whitespace();
-        let head = parts.next().unwrap_or("");
-        let result = match head {
+        let mut words = line.split_whitespace();
+        let command = words.next().unwrap_or("");
+        let result = match command {
             "l" | "list" => cmd_list(path),
             "v" | "verify" => cmd_verify(path),
             "m" | "move" => cmd_move(path),
             "r" | "recover" => cmd_recover(path),
-            #[cfg(debug_assertions)]
-            "s" | "set" => cmd_set(path),
             "h" | "help" | "?" => {
-                print_repl_help();
+                print_help();
                 Ok(())
             }
             "q" | "quit" | "exit" => break,
             other => {
-                eprintln!("unknown command `{other}` (try `h`)");
+                eprintln!("unknown command `{other}` (try `help`)");
                 Ok(())
             }
         };
-        if let Err(e) = result {
-            eprintln!("error: {e}");
+        if let Err(error) = result {
+            eprintln!("error: {error}");
         }
     }
     Ok(())
 }
 
-fn print_repl_help() {
-    println!("commands:");
-    println!("  l, list       show partition table");
-    println!("  v, verify     verify GPT CRCs (header + entry array)");
+/// Print available command names and their purpose.
+fn print_help() {
+    println!("\ncommands:");
+    println!("  l, list       show the GPT partition table");
+    println!("  v, verify     verify the GPT header and entry-array CRC32 values");
     println!("  m, move       move a partition (interactive)");
     println!("  r, recover    resume an interrupted move");
-    #[cfg(debug_assertions)]
-    println!("  s, set        rewrite a partition entry (debug builds only)");
-    println!("  h, help       this message");
+    println!("  h, help       show this help");
     println!("  q, quit       exit");
 }
 
+/// Open a disk read-only and parse its GPT using gptman.
+fn read_gpt(path: &Path) -> Result<GPT, String> {
+    let mut file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    GPT::find_from(&mut file).map_err(|e| format!("read GPT from {}: {e}", path.display()))
+}
+
+/// Display disk metadata and every used GPT partition entry.
 fn cmd_list(path: &Path) -> Result<(), String> {
-    let mut f = OpenOptions::new()
-        .read(true)
-        .open(path)
-        .map_err(|e| format!("open {}: {e}", path.display()))?;
-    let g = gpt::Gpt::read(&mut f)
-        .map_err(|e| format!("read GPT from {}: {e}", path.display()))?;
-    print_table(&g);
+    let gpt = read_gpt(path)?;
+    let h = &gpt.header;
+    println!("Disk GUID : {}", format_guid(&h.disk_guid));
+    println!("Sector sz : {} bytes", gpt.sector_size);
+    println!(
+        "Usable LBA: {}..={} ({} sectors)",
+        h.first_usable_lba,
+        h.last_usable_lba,
+        h.last_usable_lba - h.first_usable_lba + 1
+    );
+    println!();
+    println!("Idx  Type GUID                            Start           End          Size  Name");
+    println!("{}", "-".repeat(112));
+    for (index, partition) in gpt.iter() {
+        if !partition.is_used() {
+            continue;
+        }
+        let size = partition
+            .ending_lba
+            .checked_sub(partition.starting_lba)
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| format!("partition {index} has invalid LBA bounds"))?;
+        println!(
+            "{index:<4} {} {:>14} {:>14} {:>10}  {}",
+            format_guid(&partition.partition_type_guid),
+            partition.starting_lba,
+            partition.ending_lba,
+            size,
+            partition.partition_name.as_str()
+        );
+    }
     Ok(())
 }
 
+/// Recompute and compare the GPT header and partition-array CRC32 values.
 fn cmd_verify(path: &Path) -> Result<(), String> {
-    let mut f = OpenOptions::new()
-        .read(true)
-        .open(path)
-        .map_err(|e| format!("open {}: {e}", path.display()))?;
-    let g = gpt::Gpt::read(&mut f)
-        .map_err(|e| format!("read GPT from {}: {e}", path.display()))?;
-    g.verify().map_err(|e| format!("CRC verification failed: {e}"))?;
-    println!("CRC32 verification: OK");
+    let gpt = read_gpt(path)?;
+    let entries: Vec<_> = gpt.iter().map(|(_, entry)| entry.clone()).collect();
+    let header_crc = gpt.header.generate_crc32_checksum();
+    if header_crc != gpt.header.crc32_checksum {
+        return Err(format!(
+            "header CRC mismatch: stored {:#010x}, computed {header_crc:#010x}",
+            gpt.header.crc32_checksum
+        ));
+    }
+    let entries_crc = gpt
+        .header
+        .generate_partition_entry_array_crc32(&entries);
+    if entries_crc != gpt.header.partition_entry_array_crc32 {
+        return Err(format!(
+            "partition-array CRC mismatch: stored {:#010x}, computed {entries_crc:#010x}",
+            gpt.header.partition_entry_array_crc32
+        ));
+    }
+    println!("GPT CRC32 verification: OK");
     Ok(())
 }
 
+/// Collect move parameters, confirm the destructive operation, and execute it.
 fn cmd_move(path: &Path) -> Result<(), String> {
     cmd_list(path)?;
     println!();
-
-    let idx: u32 = prompt_required("Partition index: ")?;
-    let mut probe = FileDisk::open(path, idx).map_err(|e| format!("{e}"))?;
-    let current = probe.get_partition().map_err(|e| format!("{e}"))?;
-    drop(probe);
-
-    let old_start = current.start();
-    let len = current.len();
-    let old_end = old_start + len - 1;
-    println!("partition {idx}: LBA {old_start}..={old_end} ({len} sectors)");
+    let index: u32 = prompt_required("Partition index: ")?;
+    let mut disk = GptDisk::open(path, index).map_err(|e| e.to_string())?;
+    let current = disk.partition().map_err(|e| e.to_string())?;
+    let old_start = current.start;
+    let len = current.len;
+    let old_end = old_start
+        .checked_add(len - 1)
+        .ok_or_else(|| "current partition end overflows".to_string())?;
+    println!("partition {index}: LBA {old_start}..={old_end} ({len} sectors)");
 
     let new_start: u64 = prompt_required("New start LBA: ")?;
-    let displacement = new_start as i64 - old_start as i64;
+    let displacement = i128::from(new_start) - i128::from(old_start);
     if displacement == 0 {
         return Err("displacement is zero (partition already there)".into());
     }
-    let max_chunk = displacement.unsigned_abs();
-    let new_end = new_start + len - 1;
+    let max_chunk = displacement.unsigned_abs() as u64;
+    let new_end = new_start
+        .checked_add(len - 1)
+        .ok_or_else(|| "new partition end overflows".to_string())?;
 
     let subchunk: u64 = prompt_required("Subchunk (sectors): ")?;
     if subchunk == 0 || subchunk > max_chunk {
-        return Err(format!(
-            "subchunk must be in 1..={max_chunk} sectors (max is abs(displacement))"
-        ));
+        return Err(format!("subchunk must be in 1..={max_chunk} sectors"));
     }
-
-    let chunk: u64 = prompt_optional(&format!("Chunk (sectors, blank = {max_chunk}): "))?
+    let chunk = prompt_optional::<u64>(&format!("Chunk (sectors, blank = {max_chunk}): "))?
         .unwrap_or(max_chunk);
     if chunk == 0 || chunk > max_chunk {
         return Err(format!("chunk must be in 1..={max_chunk} sectors"));
@@ -157,281 +222,115 @@ fn cmd_move(path: &Path) -> Result<(), String> {
     if subchunk > chunk {
         return Err(format!("subchunk ({subchunk}) exceeds chunk ({chunk})"));
     }
-
-    let store_input = prompt_line("Store path (blank = none): ")?;
-    let store_path: Option<PathBuf> = if store_input.trim().is_empty() {
+    let store_path = prompt_line("Metadata mirror path (blank = none): ")?;
+    let store_path = if store_path.trim().is_empty() {
         None
     } else {
-        Some(PathBuf::from(store_input.trim()))
+        Some(PathBuf::from(store_path.trim()))
     };
 
-    let chunks_total = len.div_ceil(chunk);
-    let checkpoints = chunk.div_ceil(subchunk);
-
-    println!();
-    println!("about to move partition {idx}:");
+    let chunks = len.div_ceil(chunk);
+    println!("\nabout to move partition {index}:");
     println!("  from LBA {old_start}..={old_end}");
     println!("  to   LBA {new_start}..={new_end} (displacement {displacement:+})");
-    println!("  chunk    {chunk} sectors → {chunks_total} chunk(s)");
-    println!("  subchunk {subchunk} sectors → ~{checkpoints} checkpoint(s) per chunk");
-    match &store_path {
-        Some(p) => println!("  metadata mirror: {}", p.display()),
-        None => println!("  metadata mirror: (none)"),
+    println!("  chunk    {chunk} sectors → {chunks} chunk(s)");
+    println!("  subchunk {subchunk} sectors");
+    println!(
+        "  metadata mirror: {}",
+        store_path.as_ref().map_or_else(|| "(none)".into(), |p| p.display().to_string())
+    );
+    if store_path.is_none() {
+        eprintln!("warning: no metadata mirror; recovery relies on the on-disk record");
     }
-    println!();
-
-    let mut store: Option<FileStore> = match store_path {
-        Some(p) => Some(FileStore::new(p)),
-        None => {
-            eprintln!("warning: no metadata mirror.");
-            eprintln!("  If the process is killed during the resize phase,");
-            eprintln!("  the move cannot be recovered automatically.");
-            eprintln!();
-            if !confirm("continue without a metadata mirror?") {
-                return Err("aborted by user".into());
-            }
-            None
-        }
-    };
-
-    if !confirm("proceed?") {
+    if !confirm("Proceed? This operation writes to the disk") {
         return Err("aborted by user".into());
     }
 
-    let mut disk = FileDisk::open(path, idx).map_err(|e| format!("{e}"))?;
-    let request = MoveRequest::new(old_start, len, new_start, chunk, subchunk)
-        .map_err(|e| format!("invalid request: {e}"))?;
-
-    let store_ref: Option<&mut dyn MetaStore> =
-        store.as_mut().map(|s| -> &mut dyn MetaStore { s });
-    mover::execute(&mut disk, Some(request), store_ref)
-        .map_err(|e| format!("move failed: {e}"))?;
-
-    println!();
-    println!("move complete");
-    println!();
-    cmd_list(path)?;
-    Ok(())
+    let mut store = store_path.map(FileStore::new);
+    let store_ref: Option<&mut dyn RecordStore> =
+        store.as_mut().map(|s| s as &mut dyn RecordStore);
+    let request = MoveRequest {
+        old_start,
+        new_start,
+        len,
+        chunk_size: chunk,
+        subchunk_size: subchunk,
+        verify: Verify::Full,
+    };
+    execute(&mut disk, store_ref, Some(request)).map_err(|e| format!("move failed: {e}"))?;
+    println!("\nmove complete\n");
+    cmd_list(path)
 }
 
+/// Resume a move from the selected partition's on-disk journal.
 fn cmd_recover(path: &Path) -> Result<(), String> {
-    println!("Looking for an interrupted move on this image.");
-    println!();
+    println!("Looking for an interrupted move.\n");
     cmd_list(path)?;
     println!();
-
-    let idx: u32 = prompt_required("Partition index: ")?;
-    let store_input = prompt_line("Store path (blank = rely on on-disk metadata only): ")?;
-    let mut store: Option<FileStore> = if store_input.trim().is_empty() {
+    let index: u32 = prompt_required("Partition index: ")?;
+    let store_input = prompt_line("Metadata mirror path (blank = on-disk record only): ")?;
+    let mut store = if store_input.trim().is_empty() {
         None
     } else {
         Some(FileStore::new(PathBuf::from(store_input.trim())))
     };
-
-    let mut disk = FileDisk::open(path, idx).map_err(|e| format!("{e}"))?;
-    let store_ref: Option<&mut dyn MetaStore> =
-        store.as_mut().map(|s| -> &mut dyn MetaStore { s });
-    match mover::execute(&mut disk, None, store_ref) {
-        Ok(()) => {
-            println!();
-            println!("recovery complete");
-            println!();
-            cmd_list(path)?;
-            Ok(())
-        }
-        Err(mover::Error::NoTransaction) => Err(format!(
-            "no interrupted move found on partition {idx} \
-             (checked the on-disk metadata sector and the store)"
-        )),
-        Err(e) => Err(format!("recovery failed: {e}")),
-    }
+    let store_ref: Option<&mut dyn RecordStore> =
+        store.as_mut().map(|s| s as &mut dyn RecordStore);
+    let mut disk = GptDisk::open(path, index).map_err(|e| e.to_string())?;
+    execute(&mut disk, store_ref, None).map_err(|e| format!("recovery failed: {e}"))?;
+    println!("\nrecovery complete\n");
+    cmd_list(path)
 }
 
-#[cfg(debug_assertions)]
-fn cmd_set(path: &Path) -> Result<(), String> {
-    cmd_list(path)?;
-    println!();
-    eprintln!("warning: `set` rewrites the GPT entry without touching the data.");
-    eprintln!("  The filesystem will not be where the table says it is.");
-    eprintln!();
-    if !confirm("continue?") {
-        return Err("aborted by user".into());
-    }
-
-    let idx: u32 = prompt_required("Partition index: ")?;
-    let start: u64 = prompt_required("New start LBA: ")?;
-    let end: u64 = prompt_required("New end LBA: ")?;
-
-    let mut f = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|e| format!("open {}: {e}", path.display()))?;
-    let mut g = gpt::Gpt::read(&mut f).map_err(|e| format!("read GPT: {e}"))?;
-    g.set_partition_lbas(idx, start, end).map_err(|e| format!("{e}"))?;
-    g.write_to(&mut f).map_err(|e| format!("write GPT: {e}"))?;
-
-    println!("partition {idx}: LBA {start}..={end}");
-    cmd_list(path)?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Prompt helpers
-// ---------------------------------------------------------------------------
-
-fn prompt_line(msg: &str) -> Result<String, String> {
-    if !msg.is_empty() {
-        print!("{msg}");
+/// Print a prompt and read one line, returning an error on EOF or I/O failure.
+fn prompt_line(message: &str) -> Result<String, String> {
+    if !message.is_empty() {
+        print!("{message}");
         io::stdout().flush().map_err(|e| e.to_string())?;
     }
     let mut line = String::new();
-    match io::stdin().lock().read_line(&mut line) {
-        Ok(0) => Err("EOF".into()),
+    match io::stdin().read_line(&mut line) {
+        Ok(0) => Err("end of input".into()),
         Ok(_) => Ok(line.trim_end_matches(['\n', '\r']).to_string()),
         Err(e) => Err(e.to_string()),
     }
 }
 
-fn prompt_required<T: std::str::FromStr>(msg: &str) -> Result<T, String> {
+/// Repeatedly prompt until the input parses as `T`.
+fn prompt_required<T: std::str::FromStr>(message: &str) -> Result<T, String> {
     loop {
-        let s = prompt_line(msg)?;
-        let s = s.trim();
-        if s.is_empty() {
-            eprintln!("  required");
-            continue;
-        }
-        match s.parse::<T>() {
-            Ok(v) => return Ok(v),
-            Err(_) => {
-                eprintln!("  not a valid value, try again");
-                continue;
-            }
+        let input = prompt_line(message)?;
+        match input.trim().parse::<T>() {
+            Ok(value) => return Ok(value),
+            Err(_) => eprintln!("  enter a valid value"),
         }
     }
 }
 
-fn prompt_optional<T: std::str::FromStr>(msg: &str) -> Result<Option<T>, String> {
-    let s = prompt_line(msg)?;
-    let s = s.trim();
-    if s.is_empty() {
+/// Parse an optional value; blank input returns `None`.
+fn prompt_optional<T: std::str::FromStr>(message: &str) -> Result<Option<T>, String> {
+    let input = prompt_line(message)?;
+    if input.trim().is_empty() {
         return Ok(None);
     }
-    s.parse::<T>()
-        .map(Some)
-        .map_err(|_| "not a valid value".into())
+    input.trim().parse::<T>().map(Some).map_err(|_| "invalid value".into())
 }
 
-fn confirm(msg: &str) -> bool {
-    print!("{msg} [y/N] ");
+/// Ask for explicit yes/no confirmation; all answers except yes are false.
+fn confirm(message: &str) -> bool {
+    print!("{message} [y/N] ");
     let _ = io::stdout().flush();
-    match prompt_line("") {
-        Ok(s) => matches!(s.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
-        Err(_) => false,
-    }
+    matches!(
+        prompt_line("").unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    )
 }
 
-// ---------------------------------------------------------------------------
-// Table printing
-// ---------------------------------------------------------------------------
-
-fn print_table(g: &gpt::Gpt) {
-    let width = terminal_width();
-
-    println!("Disk GUID : {}", gpt::format_guid(&g.header.disk_guid));
-    println!("Sector sz : {} bytes", g.sector_size);
-    println!(
-        "Usable LBA: {}..={} ({} sectors)",
-        g.first_usable_lba(),
-        g.last_usable_lba(),
-        g.usable_lba_count()
-    );
-    match g.verify() {
-        Ok(()) => println!("CRC32     : OK"),
-        Err(e) => println!("CRC32     : FAILED ({e})"),
-    }
-    println!();
-
-    const IDX_W: usize = 4;
-    const START_W: usize = 11;
-    const END_W: usize = 11;
-    const SIZE_W: usize = 10;
-    const SPACERS: usize = 5;
-    const TYPE_MIN: usize = 20;
-    const TYPE_MAX: usize = 34;
-    const NAME_MIN: usize = 12;
-
-    let fixed = IDX_W + START_W + END_W + SIZE_W + SPACERS;
-    let flexible = width.saturating_sub(fixed);
-    let (include_type, type_w, name_w) = if flexible >= TYPE_MIN + NAME_MIN {
-        let t = TYPE_MAX.min(flexible - NAME_MIN);
-        (true, t, flexible - t)
-    } else {
-        (false, 0, flexible.max(NAME_MIN.min(width)))
-    };
-
-    let mut header = String::new();
-    header.push_str(&fit("Idx", IDX_W));
-    header.push(' ');
-    if include_type {
-        header.push_str(&fit("Type", type_w));
-        header.push(' ');
-    }
-    header.push_str(&fit("Start", START_W));
-    header.push(' ');
-    header.push_str(&fit("End", END_W));
-    header.push(' ');
-    header.push_str(&fit("Size", SIZE_W));
-    header.push(' ');
-    header.push_str(&fit("Name", name_w));
-    println!("{header}");
-    println!("{}", "-".repeat(header.chars().count().min(width)));
-
-    for p in &g.partitions {
-        let mut row = String::new();
-        row.push_str(&fit(&p.index.to_string(), IDX_W));
-        row.push(' ');
-        if include_type {
-            row.push_str(&fit(p.type_name.unwrap_or("Unknown"), type_w));
-            row.push(' ');
-        }
-        row.push_str(&fit(&p.starting_lba.to_string(), START_W));
-        row.push(' ');
-        row.push_str(&fit(&p.ending_lba.to_string(), END_W));
-        row.push(' ');
-        row.push_str(&fit(&p.size_in_lbas().to_string(), SIZE_W));
-        row.push(' ');
-        row.push_str(&fit(&p.name, name_w));
-        println!("{row}");
-    }
-}
-
-fn fit(s: &str, w: usize) -> String {
-    if w == 0 {
-        return String::new();
-    }
-    let count = s.chars().count();
-    if count <= w {
-        let mut out = String::with_capacity(w);
-        out.push_str(s);
-        for _ in count..w {
-            out.push(' ');
-        }
-        out
-    } else {
-        let mut out = String::with_capacity(w);
-        for c in s.chars().take(w - 1) {
-            out.push(c);
-        }
-        out.push('…');
-        out
-    }
-}
-
-fn terminal_width() -> usize {
-    env::var("COLUMNS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(80)
+/// Format a GPT GUID using the conventional mixed-endian textual layout.
+fn format_guid(guid: &[u8; 16]) -> String {
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        guid[3], guid[2], guid[1], guid[0], guid[5], guid[4], guid[7], guid[6],
+        guid[8], guid[9], guid[10], guid[11], guid[12], guid[13], guid[14], guid[15]
+    )
 }

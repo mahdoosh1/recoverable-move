@@ -1,838 +1,510 @@
-//! The move algorithm.
+//! Crash-safe state machine that relocates overlapping partition extents.
 //!
-//! A move proceeds through a fixed sequence of [`Phase`]s. Each phase is a
-//! milestone, not an atomic step: a crash may land anywhere inside one,
-//! and recovery reconstructs the state from the metadata plus whatever is
-//! already on disk.
-//!
-//! # Data movement
-//!
-//! Data is copied in *chunks* of at most `|X|` sectors. A chunk's source
-//! and destination never overlap, so the copy within a chunk is safe in
-//! either direction. The chunks are processed so that a chunk's
-//! destination never lands on another chunk's not-yet-copied source:
-//! forward moves process the highest chunk first, backward moves the
-//! lowest.
-//!
-//! Within a chunk, *checkpoints* record progress. A checkpoint is the last
-//! sector of each *subchunk*, and it moves through three states:
-//!
-//! ```text
-//! zeroed  →  sentinel  →  real data
-//! ```
-//!
-//! The chunk copy zeroes every checkpoint first, stamps each one with a
-//! sentinel as the copy reaches it, and restores it to real data once the
-//! chunk is fully copied. Recovery reads the checkpoints, finds the last
-//! sentinel, and resumes immediately after it.
+//! Chunks are processed in a direction-dependent order. Each chunk uses sentinel
+//! checkpoint sectors so a restart can distinguish copied data from unfinished
+//! subchunks without requiring a second full-sized journal.
 
-use std::fmt;
+use crate::record::{Phase, Record, RECORD_SECTORS};
+use crate::traits::{Disk, RecordStore};
+use crate::{Error, Geometry, MARKER_TYPE_GUID, Placement};
 
-use crate::traits::{Disk, MetaStore};
-
-pub const SECTOR_SIZE: usize = 512;
-pub const CHECKPOINT_SECTORS: u64 = 1;
-
-const MAGIC: u64 = 0x4D4F_5645_5041_5254;
-const VERSION: u16 = 3;
-const CHECKSUM_OFFSET: usize = 508;
-const SENTINEL: u8 = 0xA5;
-
-/// Sizing used by the original design. Exposed as a starting point, not a
-/// default.
-pub mod example {
-    use super::SECTOR_SIZE;
-
-    pub const SUBCHUNK_BYTES: u64 = 128 * 1024 * 1024;
-    pub const CHUNK_BYTES: u64 = 32 * 1024 * 1024 * 1024;
-    pub const SUBCHUNK_SECTORS: u64 = SUBCHUNK_BYTES / SECTOR_SIZE as u64;
-    pub const CHUNK_SECTORS: u64 = CHUNK_BYTES / SECTOR_SIZE as u64;
-    pub const SUBCHUNKS_PER_CHUNK: u64 = CHUNK_SECTORS / SUBCHUNK_SECTORS;
-}
-
-// --- Phase -------------------------------------------------------------
-
-/// Milestones of a move. The discriminants are spaced by 4 so that
-/// intermediate states can be inserted later without renumbering.
+/// How much of each chunk is checked against its source before the chunk is
+/// declared done.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u16)]
-pub enum Phase {
-    Init = 4,
-    Zero = 8,
-    Copy = 12,
-    Finalize = 16,
-    Verify = 20,
-    Resize = 24,
+pub enum Verify {
+    /// Skip data comparison after copying.
+    None,
+    /// Compare only checkpoint sectors after each chunk.
+    Checkpoints,
+    /// Compare every sector in each completed chunk against its source.
+    Full,
 }
 
-impl Phase {
-    const fn from_raw(value: u16) -> Option<Self> {
-        Some(match value {
-            4 => Self::Init,
-            8 => Self::Zero,
-            12 => Self::Copy,
-            16 => Self::Finalize,
-            20 => Self::Verify,
-            24 => Self::Resize,
-            _ => return None,
-        })
-    }
-}
-
-// --- Error -------------------------------------------------------------
-
-#[derive(Debug)]
-pub enum Error {
-    Io(std::io::Error),
-    Corrupt(String),
-    InvalidParams(String),
-    NoTransaction,
-    Verify(String),
-    /// Returned by the test mock when crash injection fires. Never
-    /// produced by the mover itself.
-    Crash,
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "I/O: {e}"),
-            Self::Corrupt(s) => write!(f, "corrupt state: {s}"),
-            Self::InvalidParams(s) => write!(f, "invalid parameters: {s}"),
-            Self::NoTransaction => f.write_str("no transaction in progress"),
-            Self::Verify(s) => write!(f, "verification failed: {s}"),
-            Self::Crash => f.write_str("simulated crash"),
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-
-impl From<crate::gpt::Error> for Error {
-    fn from(e: crate::gpt::Error) -> Self {
-        Self::Corrupt(e.to_string())
-    }
-}
-
-// --- Extent ------------------------------------------------------------
-
-/// A half-open sector range `[start, end)`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Extent {
-    start: u64,
-    end: u64,
-}
-
-impl Extent {
-    /// Construct an extent. Returns an error if `start > end`.
-    pub fn new(start: u64, end: u64) -> Result<Self, Error> {
-        if start > end {
-            return Err(Error::InvalidParams(
-                "extent start greater than end".into(),
-            ));
-        }
-        Ok(Self { start, end })
-    }
-
-    pub const fn start(self) -> u64 { self.start }
-    pub const fn end(self) -> u64 { self.end }
-    pub const fn len(self) -> u64 { self.end - self.start }
-    pub const fn is_empty(self) -> bool { self.start == self.end }
-    pub const fn contains(self, lba: u64) -> bool {
-        lba >= self.start && lba < self.end
-    }
-}
-
-// --- Metadata ----------------------------------------------------------
-
-/// Persistent record of an in-flight move. Always encoded into exactly
-/// one sector, checksummed so a torn write is detected on recovery.
+#[derive(Clone, Copy, Debug)]
+/// Parameters for starting a partition relocation.
 ///
-/// Fields are private; the only way to obtain a `Metadata` is through
-/// [`Metadata::new`] or [`Metadata::decode`], both of which run the same
-/// invariant checks. A live `Metadata` is always internally consistent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Metadata {
-    phase: Phase,
-    widen_forward: bool,
-    old_start: u64,
-    len: u64,
-    displacement: i64,
-    chunk_size: u64,
-    subchunk_size: u64,
-    chunks_total: u64,
-    chunks_done: u64,
+/// All addresses and sizes are measured in sectors. The source and target must
+/// overlap, and `chunk_size` is clamped to the displacement magnitude.
+pub struct MoveRequest {
+    /// Original partition start LBA.
+    pub old_start: u64,
+    /// Desired final partition start LBA.
+    pub new_start: u64,
+    /// Partition length in sectors.
+    pub len: u64,
+    /// Requested maximum chunk length in sectors.
+    pub chunk_size: u64,
+    /// Requested checkpoint spacing in sectors.
+    pub subchunk_size: u64,
+    /// Verification policy applied to each completed chunk.
+    pub verify: Verify,
 }
 
-/// The geometry fields, checked identically by `Metadata::new` and
-/// `Metadata::decode`.
-struct Shape {
-    old_start: u64,
-    len: u64,
-    displacement: i64,
-    chunk_size: u64,
-    subchunk_size: u64,
-    widen_forward: bool,
+/// The sentinel written into a checkpoint sector while its chunk is being
+/// copied. A fixed constant: recovery must recognise it from the record alone,
+/// and a payload that matches it costs a subchunk redundant rewrite, not correctness.
+const SENTINEL: [u8; 512] = [
+    0x3F, 0x9A, 0xC4, 0x51, 0x7E, 0x22, 0xB8, 0x0D, 0xE1, 0x6C, 0x93, 0x47, 0xAF, 0x15, 0xD2, 0x88,
+    0x71, 0x5B, 0x2E, 0xF9, 0x46, 0xC3, 0x0A, 0x9D, 0x36, 0xE8, 0x54, 0xBF, 0x1C, 0x7A, 0x63, 0xD0,
+    0x8B, 0x47, 0xF2, 0x19, 0xA6, 0x3C, 0xE5, 0x70, 0x0F, 0xB4, 0x5D, 0xCA, 0x21, 0x96, 0x38, 0xEF,
+    0x52, 0x0C, 0xAD, 0x7B, 0xE3, 0x94, 0x18, 0x6F, 0xC7, 0x2A, 0x85, 0x5E, 0xB1, 0x40, 0xF8, 0x13,
+    0x6D, 0xC2, 0x37, 0x99, 0x04, 0xEB, 0x5A, 0xA1, 0x7F, 0x28, 0xD4, 0x8E, 0x41, 0xB6, 0x0B, 0x63,
+    0xF5, 0x1A, 0x9C, 0xE0, 0x47, 0x7C, 0x32, 0xBB, 0x05, 0xD8, 0x6E, 0x91, 0xAC, 0x3E, 0x57, 0x24,
+    0xC9, 0x80, 0x16, 0x4D, 0xA3, 0xF7, 0x0E, 0x5C, 0xE9, 0x31, 0x74, 0xBD, 0x22, 0x8A, 0x66, 0xD1,
+    0x4B, 0x9F, 0x03, 0xE4, 0x58, 0xB0, 0x2D, 0x76, 0xC1, 0x3A, 0x8D, 0x55, 0xFA, 0x17, 0x6B, 0xA9,
+    0x30, 0xDD, 0x42, 0x8C, 0x75, 0xE2, 0x09, 0xB9, 0x54, 0x1F, 0x6A, 0xC8, 0x93, 0x27, 0xFE, 0x4D,
+    0xB7, 0x58, 0x0A, 0xE6, 0x3D, 0x81, 0xC3, 0x19, 0x76, 0xAF, 0x62, 0x0B, 0xE8, 0x45, 0x9C, 0x31,
+    0x5D, 0xF4, 0x28, 0x87, 0xC0, 0x13, 0x6E, 0xBA, 0x09, 0x72, 0xEB, 0x46, 0x8F, 0x25, 0xD7, 0x63,
+    0x91, 0x38, 0xAC, 0x05, 0x7E, 0xC6, 0x2B, 0xF0, 0x54, 0x9A, 0x1D, 0x67, 0xB2, 0xE4, 0x0F, 0x7B,
+    0x46, 0xD9, 0x2F, 0x85, 0xE1, 0x3C, 0x70, 0xAB, 0x12, 0x6D, 0xB8, 0x4F, 0x93, 0x26, 0xEA, 0x5C,
+    0x08, 0x7F, 0xC3, 0x5A, 0xB6, 0x21, 0xE9, 0x44, 0x8D, 0x0A, 0x75, 0xD2, 0x6C, 0x3B, 0x9F, 0xE7,
+    0x51, 0xA4, 0x0E, 0x7C, 0xD5, 0x69, 0x32, 0xBE, 0x18, 0x95, 0xE0, 0x47, 0x8A, 0x2D, 0xF1, 0x60,
+    0xBC, 0x07, 0x6F, 0xD3, 0x2A, 0x9E, 0x45, 0x71, 0xFA, 0x34, 0xC8, 0x1C, 0x83, 0x5B, 0xE6, 0x90,
+    0x2C, 0xF7, 0x61, 0x9B, 0x38, 0xD0, 0x4A, 0xB5, 0x0D, 0x76, 0xE2, 0x89, 0x54, 0x1F, 0xA7, 0xC3,
+    0x7D, 0x04, 0xEB, 0x52, 0x9F, 0x26, 0x6A, 0xC1, 0x33, 0x8B, 0xF0, 0x17, 0x64, 0xD9, 0x2E, 0x85,
+    0xA0, 0x3F, 0x96, 0x0B, 0x74, 0xD7, 0x21, 0x5C, 0xE8, 0x43, 0x8A, 0x1E, 0xB2, 0x6F, 0x35, 0xCD,
+    0x56, 0x91, 0x0C, 0xE3, 0x7A, 0x28, 0xB4, 0x4D, 0x9F, 0x60, 0xD5, 0x1A, 0x87, 0x32, 0xEB, 0x44,
+    0xFE, 0x19, 0x75, 0xC2, 0x0D, 0x6B, 0x90, 0x3A, 0xB7, 0x54, 0xE1, 0x28, 0x8C, 0xF3, 0x46, 0x6D,
+    0x31, 0xAC, 0x58, 0xE7, 0x02, 0x7B, 0xC9, 0x14, 0x6E, 0x9D, 0x42, 0xB0, 0x3D, 0x75, 0xE4, 0x51,
+    0x8A, 0x0F, 0xD6, 0x63, 0x21, 0xBC, 0x4E, 0x97, 0x05, 0x7A, 0xE8, 0x39, 0xC4, 0x12, 0x6F, 0xAB,
+    0x50, 0x9E, 0x37, 0xC1, 0x6D, 0x84, 0xFB, 0x2A, 0x0E, 0xD5, 0x79, 0x43, 0xA6, 0x1B, 0xE2, 0x68,
+    0xC7, 0x24, 0x8F, 0x1D, 0x5B, 0xE0, 0x76, 0x93, 0x3A, 0xBC, 0x47, 0x09, 0xF1, 0x6C, 0x28, 0xD4,
+    0x6B, 0x82, 0xEF, 0x15, 0x40, 0xA9, 0x3C, 0x77, 0xD2, 0x0B, 0x65, 0x9F, 0x31, 0xE4, 0x58, 0xAC,
+    0x13, 0x76, 0xD8, 0x4A, 0xB1, 0x0F, 0xE7, 0x52, 0x9C, 0x3D, 0x61, 0x85, 0xFA, 0x27, 0x6E, 0xC0,
+    0x94, 0x38, 0x7D, 0xE1, 0x0A, 0x56, 0xBF, 0x2C, 0x63, 0xD9, 0x10, 0x87, 0x4B, 0xAE, 0x35, 0xF6,
+    0x21, 0xC9, 0x5E, 0x74, 0xE8, 0x03, 0x9A, 0x46, 0xBD, 0x6F, 0x12, 0xD7, 0x58, 0x83, 0xEC, 0x30,
+    0x7C, 0x45, 0xA3, 0x9F, 0x2B, 0xD6, 0x60, 0x18, 0xE5, 0x71, 0x8A, 0x3F, 0xC2, 0x59, 0x04, 0xBD,
+    0xD0, 0x69, 0x1E, 0x83, 0x57, 0xEC, 0x2F, 0x9B, 0x46, 0xA1, 0x70, 0x3D, 0xC8, 0x14, 0x6A, 0xF2,
+    0x0B, 0x9D, 0x35, 0xE7, 0x48, 0x72, 0xC6, 0x51, 0xAF, 0x08, 0x63, 0xB4, 0x1C, 0x95, 0xDE, 0x2E,
+];
+
+/// Start a move or resume one already marked as in progress.
+///
+/// Pass `Some(request)` to start a new move. Pass `None` to request recovery;
+/// if the selected partition has the marker GUID, recovery is attempted even
+/// when a request is supplied. An optional [`RecordStore`] is a secondary
+/// journal copy, not a prerequisite for correctness.
+///
+/// # Errors
+/// Returns an [`Error`] for invalid geometry, I/O or GPT failures, missing or
+/// corrupt recovery records, and verification mismatches.
+pub fn execute(
+    disk: &mut dyn Disk,
+    mut store: Option<&mut dyn RecordStore>,
+    request: Option<MoveRequest>,
+) -> Result<(), Error> {
+    let partition = disk.partition()?;
+    if partition.type_guid == MARKER_TYPE_GUID {
+        let record = recover_record(disk, &mut store)?;
+        return run(disk, store, record, Verify::None);
+    }
+    let request = request.ok_or(Error::NoRecord)?;
+    start(disk, store, request)
 }
 
-fn check_shape(s: Shape) -> Result<(), &'static str> {
-    if s.len == 0 {
-        return Err("zero length");
+/// Validate a new request, persist its initial record, mark and widen the GPT
+/// partition, then enter the resumable state machine.
+fn start(
+    disk: &mut dyn Disk,
+    mut store: Option<&mut dyn RecordStore>,
+    request: MoveRequest,
+) -> Result<(), Error> {
+    let displacement = i64::try_from(request.new_start as i128 - request.old_start as i128)
+        .map_err(|_| Error::invalid("displacement does not fit in i64"))?;
+    let geometry = Geometry::new(request.old_start, request.len, displacement)?;
+    if request.chunk_size == 0 || request.subchunk_size == 0 {
+        return Err(Error::invalid("chunk and subchunk sizes must be nonzero"));
     }
-    if s.displacement == 0 {
-        return Err("zero displacement");
+    let chunk_size = request.chunk_size.min(geometry.displacement().unsigned_abs());
+    let subchunk_size = request.subchunk_size.min(chunk_size);
+    let partition = disk.partition()?;
+    if partition.start != geometry.old_start() || partition.len != geometry.len() {
+        return Err(Error::invalid("the partition is not where the request says it is"));
     }
-    if s.chunk_size == 0 || s.chunk_size > s.displacement.unsigned_abs() {
-        return Err("chunk size out of range");
+    let placement = choose_placement(disk, geometry)?;
+    let record = Record::new(geometry, placement, chunk_size, subchunk_size, partition.type_guid)?;
+
+    write_record(disk, &mut store, &record)?;
+    disk.set_type_guid(MARKER_TYPE_GUID)?;
+    let (start, end) = geometry.widened(placement)?;
+    disk.set_partition(start, end - start)?;
+    disk.sync()?;
+
+    run(disk, store, record, request.verify)
+}
+
+/// Select the record side that keeps the record adjacent to the final target.
+fn choose_placement(disk: &mut dyn Disk, geometry: Geometry) -> Result<Placement, Error> {
+    // Keep the record adjacent to the final target extent. This makes it
+    // directly discoverable if a crash occurs after the final GPT resize but
+    // before the marker GUID is restored. During the earlier source-extent
+    // window recovery probes outward by at most the displacement.
+    let preferred = if geometry.is_forward() { Placement::After } else { Placement::Before };
+    let (start, _) = geometry.record_range(preferred)?;
+    if disk.range_is_free(start, RECORD_SECTORS)? {
+        Ok(preferred)
+    } else {
+        Err(Error::invalid(
+            "no free space for the record sectors adjacent to the move's union",
+        ))
     }
-    if s.subchunk_size == 0 || s.subchunk_size > s.chunk_size {
-        return Err("subchunk size out of range");
+}
+
+/// Find the record of a marked partition. It is adjacent to the widened
+/// extent during the move and adjacent to the final extent after the last
+/// resize; the bounded fallback handles the brief original-extent window.
+fn recover_record(
+    disk: &mut dyn Disk,
+    store: &mut Option<&mut dyn RecordStore>,
+) -> Result<Record, Error> {
+    let partition = disk.partition()?;
+    let sector = disk.sector_size();
+
+    // The final resize can move the GPT extent away from the record sectors
+    // before the marker GUID is restored. In that narrow crash window the
+    // record is still just outside the *old union*, not adjacent to the new
+    // extent. Since the displacement is strictly smaller than the partition,
+    // it can be at most `partition.len` sectors from either final edge.
+    // Probe the four immediate boundary locations first (the widened-state
+    // fast path), then the bounded edge ranges needed for the post-resize
+    // window. A valid CRC plus extent_matches prevents accepting unrelated data.
+    // Fast path: the record is adjacent to the current (usually widened or
+    // final) extent. The two mirror sectors are tried independently.
+    let direct = [
+        partition.start.checked_sub(RECORD_SECTORS),
+        Some(partition.start),
+        partition.end().checked_sub(RECORD_SECTORS),
+        Some(partition.end()),
+    ];
+    for start in direct.into_iter().flatten() {
+        if let Some(record) = read_record_at(disk, start, sector, &partition)? {
+            return Ok(record);
+        }
     }
 
-    let target_start = s
-        .old_start
-        .checked_add_signed(s.displacement)
-        .ok_or("target start overflows")?;
-    let source_end = s.old_start.checked_add(s.len).ok_or("source end overflows")?;
-    let target_end = target_start.checked_add(s.len).ok_or("target end overflows")?;
-
-    let union_lower = s.old_start.min(target_start);
-    if !s.widen_forward && union_lower == 0 {
-        return Err("no sector before union");
+    // Before the initial widening, the marked partition still has its source
+    // extent. The record is at the final-target boundary, at most |delta|
+    // sectors beyond one of its edges. Probe lazily: do not allocate a vector
+    // proportional to the partition size (which can be very large).
+    for distance in 1..partition.len {
+        let before = partition.start
+            .checked_sub(distance)
+            .and_then(|start| start.checked_sub(RECORD_SECTORS));
+        let after = partition.end().checked_add(distance);
+        for start in [before, after].into_iter().flatten() {
+            if let Some(record) = read_record_at(disk, start, sector, &partition)? {
+                return Ok(record);
+            }
+        }
     }
-    let union_upper = source_end.max(target_end);
-    if s.widen_forward && union_upper.checked_add(1).is_none() {
-        return Err("union end overflows");
+
+    // TODO: but why is this the last measure and not the first?
+    if let Some(store) = store.as_mut()
+        && let Some(data) = (**store).read()?
+        && let Some(record) = Record::decode(&data)
+        && extent_matches(record, &partition)
+    {
+        return Ok(record);
+    }
+
+    Err(Error::corrupt(
+        "the partition is marked as in motion but no valid record was found",
+    ))
+}
+
+/// Read both mirror sectors at one possible record location. An unreadable
+/// mirror is ignored so the other copy can still be used.
+/// Try both redundant journal sectors at one candidate starting LBA.
+fn read_record_at(
+    disk: &mut dyn Disk,
+    start: u64,
+    sector_size: usize,
+    partition: &crate::traits::Partition,
+) -> Result<Option<Record>, Error> {
+    let mut buf = vec![0u8; sector_size];
+    for offset in 0..RECORD_SECTORS {
+        if disk.read_sector(start + offset, &mut buf).is_err() {
+            continue;
+        }
+        if let Some(record) = Record::decode(&buf)
+            && extent_matches(record, partition)
+        {
+            return Ok(Some(record));
+        }
+    }
+    Ok(None)
+}
+
+/// The record belongs to this partition either at the widened extent or, if
+/// the crash landed before the widen, at the source extent.
+/// Check whether the current GPT extent is a valid source, widened, or target
+/// extent for the decoded record.
+fn extent_matches(record: Record, partition: &crate::traits::Partition) -> bool {
+    if record
+        .geometry
+        .widened(record.placement)
+        .is_ok_and(|(start, end)| start == partition.start && end == partition.end())
+    {
+        return true;
+    }
+    let (target_start, target_end) = record.geometry.target();
+    let source_start = record.geometry.old_start();
+    let source_end = source_start + record.geometry.len();
+    // TODO: is this check below correct?
+    (partition.start == target_start && partition.end() == target_end)
+        || (partition.start == source_start && partition.end() == source_end)
+}
+
+/// Execute journal phases until the final extent is restored and the record cleared.
+/// Every phase is written to the journal only after its preceding work is synced.
+fn run(
+    disk: &mut dyn Disk,
+    mut store: Option<&mut dyn RecordStore>,
+    mut record: Record,
+    verify: Verify,
+) -> Result<(), Error> {
+
+    if record.phase != Phase::Resize {
+        ensure_widened(disk, &record)?;
+    }
+
+    loop {
+        match record.phase {
+            Phase::Zero => {
+                if record.chunks_done == record.chunks_total() {
+                    record.phase = Phase::Resize;
+                    write_record(disk, &mut store, &record)?;
+                    continue;
+                }
+                let index = processing_index(&record);
+                zero_checkpoints(disk, &record, index)?;
+                disk.sync()?;
+                record.phase = Phase::Copy;
+                write_record(disk, &mut store, &record)?;
+                disk.sync()?;
+            }
+            Phase::Copy => {
+                let index = processing_index(&record);
+                copy_chunk(disk, &record, index)?;
+                disk.sync()?;
+                record.phase = Phase::Finalize;
+                write_record(disk, &mut store, &record)?;
+                disk.sync()?;
+            }
+            Phase::Finalize => {
+                let index = processing_index(&record);
+                finalize_chunk(disk, &record, index)?;
+                disk.sync()?;
+                verify_chunk(disk, &record, index, verify)?;
+                record.chunks_done += 1;
+                record.phase = if record.chunks_done == record.chunks_total() {
+                    Phase::Resize
+                } else {
+                    Phase::Zero
+                };
+                write_record(disk, &mut store, &record)?;
+                disk.sync()?;
+            }
+            Phase::Resize => {
+                resize(disk, &record)?;
+                if let Some(store) = store.as_mut() {
+                    (**store).clear()?;
+                }
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Ensure the GPT partition covers the source/target union and carries the marker GUID.
+fn ensure_widened(disk: &mut dyn Disk, record: &Record) -> Result<(), Error> {
+    let (start, end) = record.geometry.widened(record.placement)?;
+    let partition = disk.partition()?;
+    if partition.start != start || partition.end() != end {
+        // below are some checks, but do we need them?
+        let source_start = record.geometry.old_start();
+        let source_end = source_start + record.geometry.len();
+        if partition.start != source_start || partition.end() != source_end {
+            return Err(Error::corrupt("the partition is neither widened nor at its source"));
+        }
+        disk.set_partition(start, end - start)?;
+        disk.sync()?;
+    }
+    // TODO: is this check even possible? setting the type guid must be one of the first steps when moving a partition.
+    if disk.partition()?.type_guid != MARKER_TYPE_GUID {
+        disk.set_type_guid(MARKER_TYPE_GUID)?;
     }
     Ok(())
 }
 
-impl Metadata {
-    /// Create a fresh metadata record for a new move. Returns an error if
-    /// any invariant fails; the caller cannot hold an invalid `Metadata`.
-    pub fn new(
-        old_start: u64,
-        len: u64,
-        displacement: i64,
-        chunk_size: u64,
-        subchunk_size: u64,
-        widen_forward: bool,
-    ) -> Result<Self, Error> {
-        let shape = Shape {
-            old_start,
-            len,
-            displacement,
-            chunk_size,
-            subchunk_size,
-            widen_forward,
-        };
-        check_shape(shape).map_err(|e| Error::InvalidParams(e.into()))?;
-
-        Ok(Self {
-            phase: Phase::Init,
-            widen_forward,
-            old_start,
-            len,
-            displacement,
-            chunk_size,
-            subchunk_size,
-            chunks_total: len.div_ceil(chunk_size),
-            chunks_done: 0,
-        })
+/// Restore the final target extent and original type GUID, then erase both record sectors.
+fn resize(disk: &mut dyn Disk, record: &Record) -> Result<(), Error> {
+    let (start, end) = record.geometry.target();
+    let partition = disk.partition()?;
+    if partition.start != start || partition.end() != end {
+        disk.set_partition(start, end - start)?;
+        disk.sync()?;
     }
+    disk.set_type_guid(record.original_type_guid)?;
 
-    // --- Accessors ---
-
-    pub const fn phase(self) -> Phase { self.phase }
-    pub const fn widen_forward(self) -> bool { self.widen_forward }
-    pub const fn old_start(self) -> u64 { self.old_start }
-    pub const fn partition_len(self) -> u64 { self.len }
-    pub const fn displacement(self) -> i64 { self.displacement }
-    pub const fn chunk_size(self) -> u64 { self.chunk_size }
-    pub const fn subchunk_size(self) -> u64 { self.subchunk_size }
-    pub const fn chunks_total(self) -> u64 { self.chunks_total }
-    pub const fn chunks_done(self) -> u64 { self.chunks_done }
-
-    /// First LBA of the target position. Infallible: `new` rejects any
-    /// value that would overflow, so a live `Metadata` cannot fail here.
-    pub const fn target_start(self) -> u64 {
-        self.old_start
-            .checked_add_signed(self.displacement)
-            .expect("displacement is validated at construction")
+    let (record_start, _) = record.geometry.record_range(record.placement)?;
+    let zero = vec![0u8; disk.sector_size()];
+    for offset in 0..RECORD_SECTORS {
+        disk.write_sector(record_start + offset, &zero)?;
     }
-
-    pub const fn is_forward(self) -> bool {
-        self.displacement > 0
-    }
-
-    const fn union_lower(self) -> u64 {
-        if self.old_start < self.target_start() {
-            self.old_start
-        } else {
-            self.target_start()
-        }
-    }
-
-    const fn union_upper(self) -> u64 {
-        let old_end = self.old_start + self.len;
-        let new_end = self.target_start() + self.len;
-        if old_end > new_end { old_end } else { new_end }
-    }
-
-    /// First sector of the extended range. Always the metadata LBA.
-    pub const fn partition_start(self) -> u64 {
-        if self.widen_forward {
-            self.union_lower()
-        } else {
-            self.union_lower() - 1
-        }
-    }
-
-    /// One past the last sector of the extended range.
-    pub const fn partition_end(self) -> u64 {
-        if self.widen_forward {
-            self.union_upper() + 1
-        } else {
-            self.union_upper()
-        }
-    }
-
-    pub const fn metadata_lba(self) -> u64 {
-        self.partition_start()
-    }
-
-    pub const fn shadow_lba(self) -> u64 {
-        self.partition_end() - 1
-    }
-
-    pub const fn partition_range(self) -> Extent {
-        Extent {
-            start: self.partition_start(),
-            end: self.partition_end(),
-        }
-    }
-
-    // --- Mutators (crate-internal) ---
-
-    pub(crate) fn set_phase(&mut self, phase: Phase) {
-        self.phase = phase;
-    }
-
-    pub(crate) fn advance_chunk(&mut self) {
-        debug_assert!(self.chunks_done < self.chunks_total);
-        self.chunks_done += 1;
-    }
-
-    // --- Serialization ---
-
-    fn encode(self) -> [u8; SECTOR_SIZE] {
-        let mut buf = [0u8; SECTOR_SIZE];
-        buf[0..8].copy_from_slice(&MAGIC.to_le_bytes());
-        buf[8..10].copy_from_slice(&VERSION.to_le_bytes());
-        buf[10..12].copy_from_slice(&(self.phase as u16).to_le_bytes());
-        buf[12] = self.widen_forward as u8;
-        buf[16..24].copy_from_slice(&self.old_start.to_le_bytes());
-        buf[24..32].copy_from_slice(&self.len.to_le_bytes());
-        buf[32..40].copy_from_slice(&self.displacement.to_le_bytes());
-        buf[40..48].copy_from_slice(&self.chunk_size.to_le_bytes());
-        buf[48..56].copy_from_slice(&self.subchunk_size.to_le_bytes());
-        buf[56..64].copy_from_slice(&self.chunks_total.to_le_bytes());
-        buf[64..72].copy_from_slice(&self.chunks_done.to_le_bytes());
-        let cs = checksum(&buf[..CHECKSUM_OFFSET]);
-        buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&cs.to_le_bytes());
-        buf
-    }
-
-    pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < SECTOR_SIZE {
-            return None;
-        }
-        if u64::from_le_bytes(buf[0..8].try_into().ok()?) != MAGIC {
-            return None;
-        }
-        if u16::from_le_bytes(buf[8..10].try_into().ok()?) != VERSION {
-            return None;
-        }
-        let stored = u32::from_le_bytes(
-            buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].try_into().ok()?,
-        );
-        if stored != checksum(&buf[..CHECKSUM_OFFSET]) {
-            return None;
-        }
-        let metadata = Self {
-            phase: Phase::from_raw(u16::from_le_bytes(buf[10..12].try_into().ok()?))?,
-            widen_forward: buf[12] != 0,
-            old_start: u64::from_le_bytes(buf[16..24].try_into().ok()?),
-            len: u64::from_le_bytes(buf[24..32].try_into().ok()?),
-            displacement: i64::from_le_bytes(buf[32..40].try_into().ok()?),
-            chunk_size: u64::from_le_bytes(buf[40..48].try_into().ok()?),
-            subchunk_size: u64::from_le_bytes(buf[48..56].try_into().ok()?),
-            chunks_total: u64::from_le_bytes(buf[56..64].try_into().ok()?),
-            chunks_done: u64::from_le_bytes(buf[64..72].try_into().ok()?),
-        };
-        metadata.validate().ok()?;
-        Some(metadata)
-    }
-
-    fn validate(self) -> Result<(), Error> {
-        check_shape(Shape {
-            old_start: self.old_start,
-            len: self.len,
-            displacement: self.displacement,
-            chunk_size: self.chunk_size,
-            subchunk_size: self.subchunk_size,
-            widen_forward: self.widen_forward,
-        })
-        .map_err(|e| Error::Corrupt(e.into()))?;
-
-        if self.chunks_total != self.len.div_ceil(self.chunk_size) {
-            return Err(Error::Corrupt("chunk count inconsistent".into()));
-        }
-        if self.chunks_done > self.chunks_total {
-            return Err(Error::Corrupt("chunks done exceeds total".into()));
-        }
-        Ok(())
-    }
+    disk.sync()?;
+    Ok(())
 }
 
-// --- Helpers -----------------------------------------------------------
-
-fn checksum(data: &[u8]) -> u32 {
-    let mut hash: u32 = 0x811c_9dc5;
-    for &byte in data {
-        hash ^= byte as u32;
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash
-}
-
-/// Physical LBA to read from when the copy wants `source`.
-///
-/// Only fires in the widened-forward, forward-move case: the first sector
-/// of the extended range is the metadata, and its original contents are
-/// parked at the shadow.
-fn source_lba(m: Metadata, source: u64) -> u64 {
-    if m.widen_forward() && m.is_forward() && source == m.metadata_lba() {
-        m.shadow_lba()
+/// Select the next chunk index in the safe direction for forward/backward moves.
+fn processing_index(record: &Record) -> u64 {
+    if record.geometry.is_forward() {
+        record.chunks_total() - 1 - record.chunks_done
     } else {
-        source
+        record.chunks_done
     }
 }
 
-/// Physical LBA to write to when the copy wants `destination`.
-///
-/// Only fires in the widened-forward, backward-move case: the first
-/// sector of the extended range is the metadata, and writes intended for
-/// it are routed to the shadow instead.
-fn destination_lba(m: Metadata, destination: u64) -> u64 {
-    if m.widen_forward() && !m.is_forward() && destination == m.metadata_lba() {
-        m.shadow_lba()
-    } else {
-        destination
-    }
+/// `(source, destination, len)` in sectors for one chunk.
+fn chunk_bounds(record: &Record, index: u64) -> (u64, u64, u64) {
+    let offset = index * record.chunk_size;
+    let source = record.geometry.old_start() + offset;
+    let len = record.chunk_size.min(record.geometry.len() - offset);
+    (source, record.geometry.target_start() + offset, len)
 }
 
-fn chunk_bounds(m: Metadata, chunk_index: u64) -> (u64, u64, u64) {
-    debug_assert!(chunk_index < m.chunks_total());
-    let source = m.old_start() + chunk_index * m.chunk_size();
-    let destination = (source as i128 + m.displacement() as i128) as u64;
-    let len = m.chunk_size().min(m.partition_len() - chunk_index * m.chunk_size());
-    (source, destination, len)
-}
-
-/// Which chunk to process next, given how many are already done.
-fn processing_index(m: Metadata, chunks_done: u64) -> u64 {
-    if m.is_forward() {
-        m.chunks_total() - 1 - chunks_done
-    } else {
-        chunks_done
-    }
-}
-
-fn is_sentinel(buf: &[u8]) -> bool {
-    buf.iter().all(|&b| b == SENTINEL)
-}
-
-/// Offsets within a chunk that carry a checkpoint. The last sector of
-/// every subchunk, plus the final sector of the chunk if the chunk is not
-/// a whole multiple of the subchunk size.
-fn checkpoint_offsets(chunk_len: u64, subchunk: u64) -> Vec<u64> {
-    let mut offsets = Vec::new();
-    let mut offset = subchunk;
-    while offset <= chunk_len {
-        offsets.push(offset - 1);
-        offset += subchunk;
-    }
-    if offsets.last().copied() != Some(chunk_len - 1) {
-        offsets.push(chunk_len - 1);
+/// Last sector of every subchunk, plus the chunk's last sector.
+/// Return the last sector of each subchunk and always include the chunk tail.
+fn checkpoints(len: u64, subchunk: u64) -> Vec<u64> {
+    let mut offsets: Vec<u64> = (1..)
+        .map(|n| n * subchunk - 1)
+        .take_while(|&offset| offset < len)
+        .collect();
+    if offsets.last() != Some(&(len - 1)) {
+        offsets.push(len - 1);
     }
     offsets
 }
 
-fn write_metadata(
-    disk: &mut dyn Disk,
-    lba: u64,
-    metadata: &Metadata,
-    store: &mut Option<&mut dyn MetaStore>,
-) -> Result<(), Error> {
-    let encoded = metadata.encode();
-    if let Some(s) = store.as_deref_mut() {
-        s.write(&encoded)?;
-    }
-    disk.write_sector(lba, &encoded)?;
-    disk.sync()
+/// Return whether every 512-byte block in `buf` matches the checkpoint sentinel.
+fn is_sentinel(buf: &[u8]) -> bool {
+    buf.len() % SENTINEL.len() == 0 && buf.chunks(SENTINEL.len()).all(|part| part == SENTINEL)
 }
 
-fn read_metadata(
-    disk: &mut dyn Disk,
-    lba: u64,
-    store: &mut Option<&mut dyn MetaStore>,
-) -> Result<Option<Metadata>, Error> {
-    if let Some(s) = store.as_deref_mut()
-        && let Some(data) = s.read()?
-            && let Some(m) = Metadata::decode(&data) {
-                return Ok(Some(m));
-            }
-    let mut buf = [0u8; SECTOR_SIZE];
-    disk.read_sector(lba, &mut buf)?;
-    Ok(Metadata::decode(&buf))
+/// Repeat the fixed sentinel pattern to fill one device sector.
+fn sentinel_for(sector_size: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(sector_size);
+    while buf.len() < sector_size {
+        let take = (sector_size - buf.len()).min(SENTINEL.len());
+        buf.extend_from_slice(&SENTINEL[..take]);
+    }
+    buf
 }
 
-// --- Parameters --------------------------------------------------------
-
-/// A request to start a new move. Constructed once, validated once.
-#[derive(Clone, Copy, Debug)]
-pub struct MoveRequest {
-    pub old_start: u64,
-    pub len: u64,
-    pub new_start: u64,
-    pub chunk_size: u64,
-    pub subchunk_size: u64,
-}
-
-impl MoveRequest {
-    pub fn new(
-        old_start: u64,
-        len: u64,
-        new_start: u64,
-        chunk_size: u64,
-        subchunk_size: u64,
-    ) -> Result<Self, Error> {
-        if len == 0 {
-            return Err(Error::InvalidParams("zero length".into()));
-        }
-        if new_start == old_start {
-            return Err(Error::InvalidParams("zero displacement".into()));
-        }
-        if subchunk_size < CHECKPOINT_SECTORS {
-            return Err(Error::InvalidParams(
-                "subchunk smaller than one checkpoint".into(),
-            ));
-        }
-        Ok(Self { old_start, len, new_start, chunk_size, subchunk_size })
-    }
-}
-
-// --- Entry points ------------------------------------------------------
-
-/// Start a new move, or resume an interrupted one.
-///
-/// If `request` is `None`, only recovery is attempted. If a move is
-/// already in flight, the request is ignored — the stored metadata is
-/// authoritative.
-///
-/// The store is optional. When supplied, it is written before every
-/// on-disk metadata sector so that a crash inside the resize phase can
-/// be recovered. When absent, a crash inside resize is unrecoverable and
-/// the caller must accept that risk.
-pub fn execute(
-    disk: &mut dyn Disk,
-    request: Option<MoveRequest>,
-    mut store: Option<&mut dyn MetaStore>,
-) -> Result<(), Error> {
-    let partition = disk.get_partition()?;
-
-    if let Some(metadata) = read_metadata(disk, partition.start(), &mut store)? {
-        let widened = metadata.partition_range();
-        let source = Extent::new(
-            metadata.old_start(),
-            metadata.old_start() + metadata.partition_len(),
-        )?;
-        if metadata.phase() != Phase::Resize && partition != widened && partition != source {
-            return Err(Error::Corrupt(format!(
-                "partition extent {partition:?} does not match metadata {widened:?}",
-            )));
-        }
-        return resume(disk, metadata.metadata_lba(), metadata, &mut store);
-    }
-
-    match request {
-        Some(req) => start(disk, req, store),
-        None => Err(Error::NoTransaction),
-    }
-}
-
-/// Begin a new move.
-pub fn start(
-    disk: &mut dyn Disk,
-    request: MoveRequest,
-    mut store: Option<&mut dyn MetaStore>,
-) -> Result<(), Error> {
-    let displacement_i128 = request.new_start as i128 - request.old_start as i128;
-    let displacement = i64::try_from(displacement_i128).map_err(|_| {
-        Error::InvalidParams("displacement does not fit in i64".into())
-    })?;
-
-    let chunk_size = request.chunk_size.min(displacement.unsigned_abs());
-    if chunk_size == 0 {
-        return Err(Error::InvalidParams("chunk size clamps to zero".into()));
-    }
-    let subchunk_size = request.subchunk_size.min(chunk_size);
-    if subchunk_size < CHECKPOINT_SECTORS {
-        return Err(Error::InvalidParams(
-            "subchunk clamps below one checkpoint".into(),
-        ));
-    }
-
-    let overflow = || Error::InvalidParams("extent end overflows".into());
-    let old_end = request.old_start.checked_add(request.len).ok_or_else(overflow)?;
-    let new_end = request.new_start.checked_add(request.len).ok_or_else(overflow)?;
-    let union_lower = request.old_start.min(request.new_start);
-    let union_upper = old_end.max(new_end);
-
-    if !disk.is_range_free(request.new_start, new_end)? {
-        return Err(Error::InvalidParams(
-            "target range overlaps another partition or is out of bounds".into(),
-        ));
-    }
-
-    let widen_forward = match union_lower.checked_sub(1) {
-        Some(candidate) if disk.is_sector_free(candidate)? => false,
-        _ => {
-            if !disk.is_sector_free(union_upper)? {
-                return Err(Error::InvalidParams(
-                    "no free sector before or after the union".into(),
-                ));
-            }
-            true
-        }
-    };
-
-    let metadata = Metadata::new(
-        request.old_start,
-        request.len,
-        displacement,
-        chunk_size,
-        subchunk_size,
-        widen_forward,
-    )?;
-
-    if metadata.widen_forward() && metadata.is_forward() {
-        let mut saved = [0u8; SECTOR_SIZE];
-        disk.read_sector(metadata.metadata_lba(), &mut saved)?;
-        disk.write_sector(metadata.shadow_lba(), &saved)?;
-        disk.sync()?;
-    }
-
-    // Persist out-of-band before the partition table changes, so a crash
-    // in the widen window is still resumable.
-    if let Some(s) = store.as_deref_mut() {
-        s.write(&metadata.encode())?;
-    }
-
-    disk.set_partition(metadata.partition_range())?;
-    disk.sync()?;
-
-    write_metadata(disk, metadata.metadata_lba(), &metadata, &mut store)?;
-    resume(disk, metadata.metadata_lba(), metadata, &mut store)
-}
-
-// --- Phase driver ------------------------------------------------------
-
-fn resume(
-    disk: &mut dyn Disk,
-    metadata_lba: u64,
-    mut metadata: Metadata,
-    store: &mut Option<&mut dyn MetaStore>,
-) -> Result<(), Error> {
-    loop {
-        match metadata.phase() {
-            Phase::Init => {
-                if disk.get_partition()? != metadata.partition_range() {
-                    disk.set_partition(metadata.partition_range())?;
-                    disk.sync()?;
-                }
-                metadata.set_phase(Phase::Zero);
-                write_metadata(disk, metadata_lba, &metadata, store)?;
-            }
-
-            Phase::Zero => {
-                if metadata.chunks_done() >= metadata.chunks_total() {
-                    metadata.set_phase(Phase::Verify);
-                    write_metadata(disk, metadata_lba, &metadata, store)?;
-                    continue;
-                }
-                let index = processing_index(metadata, metadata.chunks_done());
-                zero_checkpoints(disk, metadata, index)?;
-                disk.sync()?;
-                metadata.set_phase(Phase::Copy);
-                write_metadata(disk, metadata_lba, &metadata, store)?;
-            }
-
-            Phase::Copy => {
-                let index = processing_index(metadata, metadata.chunks_done());
-                copy_chunk(disk, metadata, index)?;
-                disk.sync()?;
-                metadata.set_phase(Phase::Finalize);
-                write_metadata(disk, metadata_lba, &metadata, store)?;
-            }
-
-            Phase::Finalize => {
-                let index = processing_index(metadata, metadata.chunks_done());
-                finalize_chunk(disk, metadata, index)?;
-                disk.sync()?;
-                metadata.advance_chunk();
-                metadata.set_phase(if metadata.chunks_done() >= metadata.chunks_total() {
-                    Phase::Verify
-                } else {
-                    Phase::Zero
-                });
-                write_metadata(disk, metadata_lba, &metadata, store)?;
-            }
-
-            Phase::Verify => {
-                verify(disk, metadata)?;
-                metadata.set_phase(Phase::Resize);
-                write_metadata(disk, metadata_lba, &metadata, store)?;
-            }
-
-            Phase::Resize => {
-                return resize(disk, metadata_lba, metadata, store);
-            }
-        }
-    }
-}
-
-// --- Phase bodies ------------------------------------------------------
-
-fn zero_checkpoints(
-    disk: &mut dyn Disk,
-    m: Metadata,
-    chunk_index: u64,
-) -> Result<(), Error> {
-    let (_, destination, chunk_len) = chunk_bounds(m, chunk_index);
-    let zero = [0u8; SECTOR_SIZE];
-    for offset in checkpoint_offsets(chunk_len, m.subchunk_size()) {
-        disk.write_sector(destination_lba(m, destination + offset), &zero)?;
+/// Zero destination checkpoint sectors so unfinished work is detectable on restart.
+fn zero_checkpoints(disk: &mut dyn Disk, record: &Record, index: u64) -> Result<(), Error> {
+    let (_, destination, len) = chunk_bounds(record, index);
+    let zero = vec![0u8; disk.sector_size()];
+    for offset in checkpoints(len, record.subchunk_size) {
+        disk.write_sector(destination + offset, &zero)?;
     }
     Ok(())
 }
 
-fn copy_chunk(
-    disk: &mut dyn Disk,
-    m: Metadata,
-    chunk_index: u64,
-) -> Result<(), Error> {
-    debug_assert_eq!(m.phase(), Phase::Copy);
-    let (source, destination, chunk_len) = chunk_bounds(m, chunk_index);
-    let subchunk = m.subchunk_size();
-    let is_checkpoint = |offset: u64| (offset + 1).is_multiple_of(subchunk) || offset == chunk_len - 1;
+/// Copy non-checkpoint sectors, using sentinels to resume at the first unfinished subchunk.
+fn copy_chunk(disk: &mut dyn Disk, record: &Record, index: u64) -> Result<(), Error> {
+    let (source, destination, len) = chunk_bounds(record, index);
+    let sentinel = sentinel_for(disk.sector_size());
+    let checkpoints = checkpoints(len, record.subchunk_size);
 
-    let mut buf = [0u8; SECTOR_SIZE];
-    let mut resume_offset = 0u64;
-    for offset in checkpoint_offsets(chunk_len, subchunk) {
-        disk.read_sector(destination_lba(m, destination + offset), &mut buf)?;
+    // finding the first unfinished subchunk
+    let mut buf = vec![0u8; disk.sector_size()];
+    let mut offset = 0;
+    for &checkpoint in &checkpoints {
+        disk.read_sector(destination + checkpoint, &mut buf)?;
         if !is_sentinel(&buf) {
             break;
         }
-        resume_offset = offset + 1;
+        offset = checkpoint + 1;
     }
 
-    let sentinel = [SENTINEL; SECTOR_SIZE];
-    let mut offset = resume_offset;
-    while offset < chunk_len {
-        let physical_destination = destination_lba(m, destination + offset);
-        if is_checkpoint(offset) {
-            disk.write_sector(physical_destination, &sentinel)?;
+    // closest checkpoint after or at offset
+    let mut next_checkpoint = checkpoints.iter().position(|&c| c >= offset).unwrap_or(checkpoints.len());
+    while offset < len {
+        if checkpoints.get(next_checkpoint) == Some(&offset) {
+            // if offset is checkpoint, we write the sentinel instead
+            disk.write_sector(destination + offset, &sentinel)?;
+            next_checkpoint += 1;
         } else {
-            disk.read_sector(source_lba(m, source + offset), &mut buf)?;
-            disk.write_sector(physical_destination, &buf)?;
+            disk.read_sector(source + offset, &mut buf)?;
+            disk.write_sector(destination + offset, &buf)?;
         }
         offset += 1;
     }
     Ok(())
 }
 
-fn finalize_chunk(
-    disk: &mut dyn Disk,
-    m: Metadata,
-    chunk_index: u64,
-) -> Result<(), Error> {
-    let (source, destination, chunk_len) = chunk_bounds(m, chunk_index);
-    let mut buf = [0u8; SECTOR_SIZE];
-    for offset in checkpoint_offsets(chunk_len, m.subchunk_size()) {
-        let physical_destination = destination_lba(m, destination + offset);
-        disk.read_sector(physical_destination, &mut buf)?;
-        if is_sentinel(&buf) {
-            let physical_source = source_lba(m, source + offset);
-            let mut data = [0u8; SECTOR_SIZE];
-            disk.read_sector(physical_source, &mut data)?;
-            disk.write_sector(physical_destination, &data)?;
+/// Restore real data to all checkpoint sectors after the ordinary sectors are copied.
+fn finalize_chunk(disk: &mut dyn Disk, record: &Record, index: u64) -> Result<(), Error> {
+    let (source, destination, len) = chunk_bounds(record, index);
+    // Every checkpoint is rewritten unconditionally. A torn restore can leave
+    // a sector that is neither the sentinel nor the real data, and the source
+    // is intact until the chunk is marked done.
+    let mut buf = vec![0u8; disk.sector_size()];
+    for offset in checkpoints(len, record.subchunk_size) {
+        disk.read_sector(source + offset, &mut buf)?;
+        disk.write_sector(destination + offset, &buf)?;
+    }
+    Ok(())
+}
+
+/// Compare destination sectors with their source according to the requested policy.
+fn verify_chunk(disk: &mut dyn Disk, record: &Record, index: u64, verify: Verify) -> Result<(), Error> {
+    if verify == Verify::None {
+        return Ok(());
+    }
+    let (source, destination, len) = chunk_bounds(record, index);
+    let offsets: Vec<u64> = match verify {
+        Verify::Checkpoints => checkpoints(len, record.subchunk_size),
+        Verify::Full => (0..len).collect(),
+        Verify::None => unreachable!(),
+    };
+
+    let mut expected = vec![0u8; disk.sector_size()];
+    let mut actual = vec![0u8; disk.sector_size()];
+    for offset in offsets {
+        disk.read_sector(source + offset, &mut expected)?;
+        disk.read_sector(destination + offset, &mut actual)?;
+        // TODO: this error should warn the user that the disk is not behaving correctly and
+        // it should be mirrored to another disk for backup. and the operation should continue
+        // from there, or otherwise the user can ignore the warning and retry the chunk
+        if expected != actual {
+            return Err(Error::Verify(format!(
+                "chunk {index} differs at sector {offset}"
+            )));
         }
     }
     Ok(())
 }
 
-fn verify(disk: &mut dyn Disk, m: Metadata) -> Result<(), Error> {
-    for chunk_index in 0..m.chunks_total() {
-        let (_, destination, chunk_len) = chunk_bounds(m, chunk_index);
-        let mut buf = [0u8; SECTOR_SIZE];
-        for offset in checkpoint_offsets(chunk_len, m.subchunk_size()) {
-            disk.read_sector(destination_lba(m, destination + offset), &mut buf)?;
-            if is_sentinel(&buf) {
-                return Err(Error::Verify(format!(
-                    "sentinel remains at chunk {chunk_index} offset {offset}"
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn resize(
+/// Write the record to both sectors, lower first, syncing between them, then
+/// to the store. A crash leaves at most one sector stale, and the store is
+/// never newer than the disk.
+/// Encode and persist both on-disk journal copies in order, syncing each write,
+/// then update the optional external mirror.
+fn write_record(
     disk: &mut dyn Disk,
-    metadata_lba: u64,
-    m: Metadata,
-    store: &mut Option<&mut dyn MetaStore>,
+    store: &mut Option<&mut dyn RecordStore>,
+    record: &Record,
 ) -> Result<(), Error> {
-    disk.set_partition(Extent::new(m.target_start(), m.target_start() + m.partition_len())?)?;
-    disk.sync()?;
-
-    if m.widen_forward() && !m.is_forward() {
-        let mut saved = [0u8; SECTOR_SIZE];
-        disk.read_sector(m.shadow_lba(), &mut saved)?;
-        disk.write_sector(metadata_lba, &saved)?;
-    } else {
-        let zero = [0u8; SECTOR_SIZE];
-        disk.write_sector(metadata_lba, &zero)?;
+    let encoded = record.encode(disk.sector_size());
+    let (start, _) = record.geometry.record_range(record.placement)?;
+    for offset in 0..RECORD_SECTORS {
+        disk.write_sector(start + offset, &encoded)?;
+        disk.sync()?;
     }
-    disk.sync()?;
-
-    if let Some(s) = store.as_deref_mut() {
-        s.remove();
+    if let Some(store) = store.as_mut() {
+        (**store).write(&encoded)?;
     }
     Ok(())
 }
