@@ -111,9 +111,14 @@ pub fn execute(
     request: Option<MoveRequest>,
 ) -> Result<(), Error> {
     let partition = disk.partition()?;
-    if partition.type_guid == MARKER_TYPE_GUID {
-        let record = recover_record(disk, &mut store)?;
-        return run(disk, store, record, Verify::None);
+    if partition.type_guid == MARKER_TYPE_GUID || request.is_none() {
+        match recover_record(disk, &mut store) {
+            Ok(record) => return run(disk, store, record, Verify::None),
+            Err(Error::Corrupt(_)) if partition.type_guid != MARKER_TYPE_GUID => {
+                return Err(Error::NoRecord);
+            }
+            Err(e) => return Err(e),
+        }
     }
     let request = request.ok_or(Error::NoRecord)?;
     start(disk, store, request)
@@ -152,9 +157,9 @@ fn start(
     )?;
 
     write_record(disk, &mut store, &record)?;
-    disk.set_type_guid(MARKER_TYPE_GUID)?;
     let (start, end) = geometry.widened(placement)?;
     disk.set_partition(start, end - start)?;
+    disk.set_type_guid(MARKER_TYPE_GUID)?;
     disk.sync()?;
 
     run(disk, store, record, request.verify)
@@ -183,7 +188,7 @@ fn choose_placement(disk: &mut dyn Disk, geometry: Geometry) -> Result<Placement
 
 /// Find the record of a marked partition. It is adjacent to the widened
 /// extent during the move and adjacent to the final extent after the last
-/// resize; the bounded fallback handles the brief original-extent window.
+/// resize.
 fn recover_record(
     disk: &mut dyn Disk,
     store: &mut Option<&mut dyn RecordStore>,
