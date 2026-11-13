@@ -171,12 +171,41 @@ fn choose_placement(disk: &mut dyn Disk, geometry: Geometry) -> Result<Placement
 /// Find the record of a marked partition. It is adjacent to the widened
 /// extent during the move and adjacent to the final extent after the last
 /// resize; the bounded fallback handles the brief original-extent window.
+
 fn recover_record(
     disk: &mut dyn Disk,
     store: &mut Option<&mut dyn RecordStore>,
 ) -> Result<Record, Error> {
     let partition = disk.partition()?;
     let sector = disk.sector_size();
+
+    // Try the external mirror first. It is a secondary recovery source,
+    // so a missing, unreadable, or invalid mirror must not prevent recovery
+    // from the primary on-disk journal.
+    if let Some(store) = store.as_mut() {
+        if let Ok(Some(data)) = (**store).read() {
+            if let Some(record) = Record::decode(&data) {
+                if extent_matches(record, &partition) {
+                    // The mirror may be one journal update behind because
+                    // the on-disk record is persisted before the mirror.
+                    // Locate the primary journal using the mirror's geometry
+                    // and prefer a valid on-disk record if one exists.
+                    let (record_start, _) =
+                        record.geometry.record_range(record.placement)?;
+
+                    if let Some(disk_record) =
+                        read_record_at(disk, record_start, sector, &partition)?
+                    {
+                        return Ok(disk_record);
+                    }
+
+                    // Both on-disk copies are unreadable. Use the validated
+                    // mirror as the recovery source.
+                    return Ok(record);
+                }
+            }
+        }
+    }
 
     // The final resize can move the GPT extent away from the record sectors
     // before the marker GUID is restored. In that narrow crash window the
@@ -186,6 +215,7 @@ fn recover_record(
     // Probe the four immediate boundary locations first (the widened-state
     // fast path), then the bounded edge ranges needed for the post-resize
     // window. A valid CRC plus extent_matches prevents accepting unrelated data.
+
     // Fast path: the record is adjacent to the current (usually widened or
     // final) extent. The two mirror sectors are tried independently.
     let direct = [
@@ -200,35 +230,11 @@ fn recover_record(
         }
     }
 
-    // Before the initial widening, the marked partition still has its source
-    // extent. The record is at the final-target boundary, at most |delta|
-    // sectors beyond one of its edges. Probe lazily: do not allocate a vector
-    // proportional to the partition size (which can be very large).
-    for distance in 1..partition.len {
-        let before = partition.start
-            .checked_sub(distance)
-            .and_then(|start| start.checked_sub(RECORD_SECTORS));
-        let after = partition.end().checked_add(distance);
-        for start in [before, after].into_iter().flatten() {
-            if let Some(record) = read_record_at(disk, start, sector, &partition)? {
-                return Ok(record);
-            }
-        }
-    }
-
-    // TODO: but why is this the last measure and not the first?
-    if let Some(store) = store.as_mut()
-        && let Some(data) = (**store).read()?
-        && let Some(record) = Record::decode(&data)
-        && extent_matches(record, &partition)
-    {
-        return Ok(record);
-    }
-
     Err(Error::corrupt(
         "the partition is marked as in motion but no valid record was found",
     ))
 }
+
 
 /// Read both mirror sectors at one possible record location. An unreadable
 /// mirror is ignored so the other copy can still be used.
@@ -515,7 +521,7 @@ fn write_record(
     store: &mut Option<&mut dyn RecordStore>,
     record: &Record,
 ) -> Result<(), Error> {
-    let encoded = record.encode(disk.sector_size());
+    let encoded = record.encode(disk.sector_size())?;
     let (start, _) = record.geometry.record_range(record.placement)?;
     for offset in 0..RECORD_SECTORS {
         disk.write_sector(start + offset, &encoded)?;
