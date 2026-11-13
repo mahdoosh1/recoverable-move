@@ -5,6 +5,10 @@ edition = "2024"
 rust-version = "1.85"
 license = "GPL-2.0-or-later"
 description = "Crash-recoverable relocation of an overlapping GPT partition"
+repository = "https://github.com/mahdoosh1/recoverable-move"
+readme = "README.md"
+keywords = ["gpt", "partition", "recovery", "disk"]
+categories = ["filesystem", "command-line-utilities"]
 
 [dependencies]
 gptman = "3.1.1"
