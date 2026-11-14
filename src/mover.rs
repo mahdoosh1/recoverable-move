@@ -165,30 +165,38 @@ fn start(
     run(disk, store, record, request.verify)
 }
 
-/// Select the record side that keeps the record adjacent to the final target.
+/// Select a free record location, preferring the side adjacent to the final
+/// target extent. If that side is unavailable, try the opposite side.
 fn choose_placement(disk: &mut dyn Disk, geometry: Geometry) -> Result<Placement, Error> {
-    // Keep the record adjacent to the final target extent. This makes it
-    // directly discoverable if a crash occurs after the final GPT resize but
-    // before the marker GUID is restored. During the earlier source-extent
-    // window recovery probes outward by at most the displacement.
     let preferred = if geometry.is_forward() {
         Placement::After
     } else {
         Placement::Before
     };
-    let (start, _) = geometry.record_range(preferred)?;
-    if disk.range_is_free(start, RECORD_SECTORS)? {
-        Ok(preferred)
-    } else {
-        Err(Error::invalid(
-            "no free space for the record sectors adjacent to the move's union",
-        ))
+    let alternate = match preferred {
+        Placement::Before => Placement::After,
+        Placement::After => Placement::Before,
+    };
+
+    for placement in [preferred, alternate] {
+        // A placement can be geometrically impossible (for example, there
+        // may be fewer than two usable sectors before LBA zero).
+        let Ok((start, _)) = geometry.record_range(placement) else {
+            continue;
+        };
+        if disk.range_is_free(start, RECORD_SECTORS)? {
+            return Ok(placement);
+        }
     }
+
+    Err(Error::invalid(
+        "no free space for the record sectors on either side of the move's union",
+    ))
 }
 
-/// Find the record of a marked partition. It is adjacent to the widened
-/// extent during the move and adjacent to the final extent after the last
-/// resize.
+/// Find a move record. It is adjacent to the widened extent during the move;
+/// after the final resize it may be displaced from the target edge when the
+/// preferred record side was unavailable.
 fn recover_record(
     disk: &mut dyn Disk,
     store: &mut Option<&mut dyn RecordStore>,
@@ -246,6 +254,29 @@ fn recover_record(
         }
     }
 
+    // Only a marked partition needs the wider search. If the GUID is not
+    // marked and no adjacent record was found, the move had not begun copying:
+    // either the initial record was written before the GPT update, or the
+    // final resize and marker restoration already completed. Avoid scanning
+    // an entire large partition on an ordinary `recover` of a clean disk.
+    if partition.type_guid == MARKER_TYPE_GUID {
+        for distance in 1..=partition.len {
+            if let Some(start) = partition
+                .start
+                .checked_sub(distance.saturating_add(RECORD_SECTORS))
+                && let Some(record) = read_record_at(disk, start, sector, &partition)?
+            {
+                return Ok(record);
+            }
+
+            if let Some(start) = partition.end().checked_add(distance)
+                && let Some(record) = read_record_at(disk, start, sector, &partition)?
+            {
+                return Ok(record);
+            }
+        }
+    }
+
     Err(Error::corrupt(
         "the partition is marked as in motion but no valid record was found",
     ))
@@ -262,7 +293,10 @@ fn read_record_at(
 ) -> Result<Option<Record>, Error> {
     let mut buf = vec![0u8; sector_size];
     for offset in 0..RECORD_SECTORS {
-        if disk.read_sector(start + offset, &mut buf).is_err() {
+        let Some(lba) = start.checked_add(offset) else {
+            continue;
+        };
+        if disk.read_sector(lba, &mut buf).is_err() {
             continue;
         }
         if let Some(record) = Record::decode(&buf)

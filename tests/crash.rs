@@ -46,6 +46,7 @@ struct MockDisk {
     partition: Partition,
     ops: u64,
     faults: Faults,
+    min_free_lba: u64,
 }
 
 impl MockDisk {
@@ -64,6 +65,7 @@ impl MockDisk {
             },
             ops: 0,
             faults: Faults::default(),
+            min_free_lba: 0,
         }
     }
 
@@ -157,10 +159,10 @@ impl Disk for MockDisk {
         self.end(op)
     }
 
-    fn range_is_free(&mut self, _start: u64, _len: u64) -> Result<bool, Error> {
+    fn range_is_free(&mut self, start: u64, _len: u64) -> Result<bool, Error> {
         let op = self.begin()?;
         self.end(op)?;
-        Ok(true)
+        Ok(start >= self.min_free_lba)
     }
 }
 
@@ -206,8 +208,9 @@ fn assert_settled(disk: &MockDisk, new_start: u64, expected: &[u8]) {
 }
 
 /// Inject a crash before and after every operation, then require recovery to settle.
-fn crash_everywhere(new_start: u64, use_store: bool) {
+fn crash_everywhere(new_start: u64, use_store: bool, min_free_lba: u64) {
     let mut baseline = MockDisk::filled(4096);
+    baseline.min_free_lba = min_free_lba;
     let expected = baseline.region(OLD, LEN);
     execute(&mut baseline, None, Some(request(new_start, Verify::Full))).unwrap();
     let total = baseline.ops;
@@ -216,6 +219,7 @@ fn crash_everywhere(new_start: u64, use_store: bool) {
     for crash_at in 1..=total {
         for before in [true, false] {
             let mut disk = MockDisk::filled(4096);
+            disk.min_free_lba = min_free_lba;
             disk.faults.crash_before = before.then_some(crash_at);
             disk.faults.crash_after = (!before).then_some(crash_at);
             let mut store = MemStore::new();
@@ -239,25 +243,32 @@ fn crash_everywhere(new_start: u64, use_store: bool) {
 #[test]
 /// Crash before/after every operation during a forward relocation.
 fn every_crash_forward() {
-    crash_everywhere(OLD + 23, false);
+    crash_everywhere(OLD + 23, false, 0);
 }
 
 #[test]
 /// Crash before/after every operation during a backward relocation.
 fn every_crash_backward() {
-    crash_everywhere(OLD - 17, false);
+    crash_everywhere(OLD - 17, false, 0);
+}
+
+#[test]
+/// Fall back to the record-after placement when the before side is outside
+/// the usable GPT range, and recover every crash point with that placement.
+fn every_crash_backward_with_before_side_unavailable() {
+    crash_everywhere(OLD - 17, false, OLD - 17);
 }
 
 #[test]
 /// Repeat forward crash injection with an external record mirror.
 fn every_crash_forward_with_store() {
-    crash_everywhere(OLD + 23, true);
+    crash_everywhere(OLD + 23, true, 0);
 }
 
 #[test]
 /// Repeat backward crash injection with an external record mirror.
 fn every_crash_backward_with_store() {
-    crash_everywhere(OLD - 17, true);
+    crash_everywhere(OLD - 17, true, 0);
 }
 
 #[test]
