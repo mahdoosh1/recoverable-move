@@ -19,7 +19,7 @@ use std::fmt::Display;
 #[derive(PartialEq)]
 pub enum Error {
     IoError(String),
-    Invalid(String)
+    Invalid(String),
 }
 
 impl Error {

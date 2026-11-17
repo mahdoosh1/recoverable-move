@@ -15,16 +15,23 @@
 // You should have received a copy of the GNU General Public License
 // along with recoverable-move. If not, see <https://www.gnu.org/licenses/>.
 
-use std::{fs::{File, OpenOptions}, os::unix::fs::FileExt, path::Path};
+use std::{
+    fs::{File, OpenOptions},
+    os::unix::fs::FileExt,
+    path::Path,
+};
 
 use gptman::GPT;
 
-use crate::{errors::Error, traits::{Disk, Partition}};
+use crate::{
+    errors::Error,
+    traits::{Disk, Partition},
+};
 
 pub struct GptDisk {
     file: File,
     gpt: GPT,
-    sector_size: usize
+    sector_size: usize,
 }
 
 impl GptDisk {
@@ -35,7 +42,7 @@ impl GptDisk {
         Ok(Self {
             file,
             gpt,
-            sector_size
+            sector_size,
         })
     }
 }
@@ -47,15 +54,20 @@ impl Disk for GptDisk {
 
     fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Error> {
         if buf.len() != self.sector_size {
-            return Err(Error::invalid("the buffer is not the same size as sector_size"))
+            return Err(Error::invalid(
+                "the buffer is not the same size as sector_size",
+            ));
         }
-        self.file.read_exact_at(buf, lba * self.sector_size as u64)?;
+        self.file
+            .read_exact_at(buf, lba * self.sector_size as u64)?;
         Ok(())
     }
 
     fn write_sector(&mut self, lba: u64, buf: &[u8]) -> Result<(), Error> {
         if buf.len() != self.sector_size {
-            return Err(Error::invalid("the buffer is not the same size as sector_size"))
+            return Err(Error::invalid(
+                "the buffer is not the same size as sector_size",
+            ));
         }
         self.file.write_all_at(buf, lba * self.sector_size as u64)?;
         Ok(())
@@ -70,31 +82,33 @@ impl Disk for GptDisk {
         let mut partitions = Vec::new();
         for (index, entry) in self.gpt.iter() {
             let index = index as usize;
-            let mut partition_name: Vec<u8> = entry.partition_name
+            let mut partition_name: Vec<u8> = entry
+                .partition_name
                 .as_str()
                 .encode_utf16()
                 .flat_map(u16::to_le_bytes)
                 .collect();
             partition_name.resize(72, 0);
-            let partition_name: [u8; 72] = *partition_name
-                .as_array()
-                .unwrap(); // won't crash; trust me
+            let partition_name: [u8; 72] = *partition_name.as_array().unwrap(); // won't crash; trust me
             let partition = Partition::new(
-                entry.starting_lba, 
-                entry.size()?, 
+                entry.starting_lba,
+                entry.size()?,
                 &entry.partition_type_guid,
-                &partition_name
+                &partition_name,
             );
             if index >= partitions.len() {
                 partitions.resize_with(index + 1, || None);
             }
             if partitions[index].is_some() {
-                return Err(Error::invalid(format!("multiple partitions with index {}", index)))
+                return Err(Error::invalid(format!(
+                    "multiple partitions with index {}",
+                    index
+                )));
             }
             partitions[index] = Some(partition);
         }
         if let Some(index) = partitions.iter().position(|x| x.is_none()) {
-            return Err(Error::invalid(format!("no partition with index {}", index)))
+            return Err(Error::invalid(format!("no partition with index {}", index)));
         }
         Ok(partitions.into_iter().map(Option::unwrap).collect())
     }
@@ -102,10 +116,10 @@ impl Disk for GptDisk {
     fn update_partition(&mut self, index: usize, partition: Partition) -> Result<(), Error> {
         let index = index as u32;
         if !self.gpt.iter().any(|(i, _)| index == i) {
-            return Err(Error::invalid("invalid index"))
+            return Err(Error::invalid("invalid index"));
         }
         self.gpt[index].starting_lba = partition.start();
-        self.gpt[index].ending_lba = partition.end()-1;
+        self.gpt[index].ending_lba = partition.end() - 1;
         self.gpt[index].partition_type_guid = *partition.guid();
         self.gpt.write_into(&mut self.file)?;
         self.file.sync_all()?;
@@ -117,7 +131,7 @@ impl Disk for GptDisk {
             end_lba += 1;
         }
         if start_lba > end_lba {
-            return Ok(false)
+            return Ok(false);
         }
         if start_lba < self.gpt.header.first_usable_lba
             || end_lba - 1 > self.gpt.header.last_usable_lba
@@ -137,5 +151,5 @@ impl Disk for GptDisk {
 }
 
 pub fn create_disk(path: impl AsRef<Path>) -> Result<GptDisk, Error> {
-    Ok(GptDisk::open(path)?)
+    GptDisk::open(path)
 }

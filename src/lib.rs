@@ -15,13 +15,12 @@
 // You should have received a copy of the GNU General Public License
 // along with recoverable-move. If not, see <https://www.gnu.org/licenses/>.
 
-const CRC32: crc::Crc<u32> =
-    crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
+const CRC32: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
 
 pub mod consts;
+pub mod errors;
+pub mod gptman_interface;
+pub mod mover;
 pub mod record;
 pub mod traits;
-pub mod errors;
-pub mod mover;
-pub mod gptman_interface;
 // mod aigenerated;

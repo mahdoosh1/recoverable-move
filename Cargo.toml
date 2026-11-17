@@ -2,7 +2,7 @@
 name = "recoverable-move"
 version = "0.1.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.98"
 license = "GPL-2.0-or-later"
 description = "Crash-recoverable relocation of an overlapping GPT partition"
 repository = "https://github.com/mahdoosh1/recoverable-move"

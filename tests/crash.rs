@@ -14,9 +14,7 @@
 
 //! Fault-injection tests for the current `Disk` / `Record` / `continue_` API.
 
-
 // THIS CODE IS AI GENERATED (by ChatGPT)
-
 
 use recoverable_move::consts::MARKER_TYPE_GUID;
 use recoverable_move::errors::Error;
@@ -51,7 +49,7 @@ struct MockDisk {
 impl MockDisk {
     fn filled(sectors: usize) -> Self {
         let mut data = vec![0; sectors * SECTOR];
-        for (lba, sector) in data.chunks_exact_mut(SECTOR).enumerate() {
+        for (lba, sector) in data.as_chunks_mut::<SECTOR>().0.iter_mut().enumerate() {
             sector.fill((lba as u8).wrapping_mul(37).wrapping_add(11));
         }
         Self {
@@ -83,7 +81,9 @@ impl MockDisk {
             .ok()
             .and_then(|n| n.checked_mul(SECTOR))
             .ok_or_else(|| io_error("LBA overflow"))?;
-        let end = start.checked_add(len).ok_or_else(|| io_error("range overflow"))?;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| io_error("range overflow"))?;
         if end > self.data.len() || len != SECTOR {
             return Err(io_error("sector outside mock disk or wrong sector size"));
         }
@@ -163,14 +163,8 @@ impl Disk for MockDisk {
 }
 
 fn make_record(disk: &MockDisk, displacement: i64) -> Record {
-    Record::new(
-        SECTOR as u32,
-        disk.partition,
-        displacement,
-        CHUNK,
-        SUBCHUNK,
-    )
-    .unwrap_or_else(|e| panic!("invalid test record: {e}"))
+    Record::new(SECTOR as u32, disk.partition, displacement, CHUNK, SUBCHUNK)
+        .unwrap_or_else(|e| panic!("invalid test record: {e}"))
 }
 
 fn start_move(disk: &mut MockDisk, displacement: i64) -> Result<(), Error> {
@@ -206,8 +200,7 @@ fn assert_settled(disk: &MockDisk, new_start: u64, original: &[u8]) {
 fn recover_or_accept_unstarted(disk: &mut MockDisk, new_start: u64) {
     match recover_record(disk, None) {
         Ok((index, record)) => {
-            continue_(disk, index, record, None)
-                .unwrap_or_else(|e| panic!("recovery failed: {e}"));
+            continue_(disk, index, record, None).unwrap_or_else(|e| panic!("recovery failed: {e}"));
         }
         Err(Error::Invalid(_))
             if disk.partition.start() == OLD
@@ -235,10 +228,12 @@ fn crash_at_every_operation(displacement: i64, blocked: Option<(u64, u64)>) {
         baseline.block_range(start, end);
     }
     let original = baseline.region(OLD, LEN);
-    start_move(&mut baseline, displacement)
-        .unwrap_or_else(|e| panic!("baseline move failed: {e}"));
+    start_move(&mut baseline, displacement).unwrap_or_else(|e| panic!("baseline move failed: {e}"));
     let operation_count = baseline.operations;
-    assert!(operation_count > 20, "unexpectedly few operations: {operation_count}");
+    assert!(
+        operation_count > 20,
+        "unexpectedly few operations: {operation_count}"
+    );
 
     for operation in 1..=operation_count {
         for crash_before in [true, false] {
@@ -265,8 +260,7 @@ fn clean_moves_preserve_data_in_both_directions() {
     for displacement in [23, -17] {
         let mut disk = MockDisk::filled(4096);
         let original = disk.region(OLD, LEN);
-        start_move(&mut disk, displacement)
-            .unwrap_or_else(|e| panic!("move failed: {e}"));
+        start_move(&mut disk, displacement).unwrap_or_else(|e| panic!("move failed: {e}"));
         moved(&disk, (OLD as i64 + displacement) as u64, &original);
     }
 }
@@ -312,14 +306,20 @@ fn every_sector_write_can_be_torn_without_losing_recoverability() {
 #[test]
 fn a_clean_disk_has_no_recoverable_record() {
     let mut disk = MockDisk::filled(4096);
-    assert!(matches!(recover_record(&mut disk, None), Err(Error::Invalid(_))));
+    assert!(matches!(
+        recover_record(&mut disk, None),
+        Err(Error::Invalid(_))
+    ));
 }
 
 #[test]
 fn marker_partition_without_a_valid_record_is_rejected() {
     let mut disk = MockDisk::filled(4096);
     disk.partition = Partition::new(OLD, LEN, &MARKER_TYPE_GUID, &LABEL);
-    assert!(matches!(recover_record(&mut disk, None), Err(Error::Invalid(_))));
+    assert!(matches!(
+        recover_record(&mut disk, None),
+        Err(Error::Invalid(_))
+    ));
 }
 
 #[test]

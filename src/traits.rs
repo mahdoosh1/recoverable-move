@@ -26,7 +26,7 @@ pub struct Partition {
     guid: [u8; 16],
     start: u64,
     len: u64,
-    partition_label: [u8; 72]
+    partition_label: [u8; 72],
 }
 
 impl Partition {
@@ -35,12 +35,13 @@ impl Partition {
             guid: *guid,
             start,
             len,
-            partition_label: *partition_label
+            partition_label: *partition_label,
         }
     }
     pub fn start(&self) -> u64 {
         self.start
     }
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> u64 {
         self.len
     }
@@ -59,15 +60,18 @@ impl Partition {
 }
 
 pub struct FileWriter {
-    file: File
+    file: File,
 }
 
 impl FileWriter {
     pub fn new(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let file = OpenOptions::new().read(true).write(true).create(true).open(path)?;
-        Ok(Self {
-            file: file
-        })
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        Ok(Self { file })
     }
     pub fn read(&mut self, data: &mut [u8]) -> Result<(), Error> {
         self.file.read_exact(data)?;
@@ -78,7 +82,6 @@ impl FileWriter {
         Ok(())
     }
 }
-
 
 // all disk read/writes can fail
 // `read` through a `File` type will mutate the value, so we use &mut self instead of &self for read operations
