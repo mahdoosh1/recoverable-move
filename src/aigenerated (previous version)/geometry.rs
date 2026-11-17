@@ -28,7 +28,7 @@
 //! assert_eq!(movement.record_range(Placement::After).unwrap(), (172, 174));
 //! ```
 
-use crate::Error;
+use super::Error;
 
 /// Where the two record sectors sit relative to the union of source and target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -29,8 +29,8 @@ use std::path::Path;
 
 use gptman::{GPT, GPTPartitionEntry};
 
-use crate::Error;
-use crate::traits::{Disk, Partition};
+use super::Error;
+use super::traits::{Disk, Partition};
 
 /// A disk image or block device whose partition table is managed by gptman.
 ///

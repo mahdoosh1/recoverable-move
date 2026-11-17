@@ -9,103 +9,96 @@
 //
 // recoverable-move is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
-// See the GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with recoverable-move. If not, see <https://www.gnu.org/licenses/>.
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
 
-//! Fault-injection integration tests for crash-safe move and recovery behaviour.
-//! The mock disk counts operations and can fail before/after writes, tear writes,
-//! or corrupt written data to exercise every persisted state transition.
+//! Fault-injection tests for the current `Disk` / `Record` / `continue_` API.
 
-use recoverable_move::traits::MemStore;
-use recoverable_move::{
-    Disk, Error, MARKER_TYPE_GUID, MoveRequest, Partition, RecordStore, Verify, execute,
-};
+use recoverable_move::consts::MARKER_TYPE_GUID;
+use recoverable_move::errors::Error;
+use recoverable_move::mover::{continue_, recover_record};
+use recoverable_move::record::Record;
+use recoverable_move::traits::{Disk, Partition};
 
 const SECTOR: usize = 512;
 const OLD: u64 = 100;
 const LEN: u64 = 60;
 const CHUNK: u64 = 7;
-const SUB: u64 = 3;
+const SUBCHUNK: u64 = 3;
 const ORIGINAL_GUID: [u8; 16] = [0x11; 16];
+const LABEL: [u8; 72] = [0; 72];
 
 #[derive(Clone, Copy, Debug, Default)]
-/// Operation numbers at which the mock disk should simulate failures.
 struct Faults {
-    crash_before: Option<u64>,
-    crash_after: Option<u64>,
+    before: Option<u64>,
+    after: Option<u64>,
     tear: Option<u64>,
-    corrupt: Option<u64>,
 }
 
-/// In-memory sector device with a single GPT-like partition and fault injection.
+/// A sector-addressable disk with one mutable partition and deterministic data.
 struct MockDisk {
     data: Vec<u8>,
     partition: Partition,
-    ops: u64,
+    operations: u64,
     faults: Faults,
-    min_free_lba: u64,
+    unavailable: Vec<(u64, u64)>,
 }
 
 impl MockDisk {
-    /// Build a deterministic disk image filled with sector-dependent byte patterns.
-    fn filled(sectors: u64) -> Self {
-        let mut data = vec![0u8; sectors as usize * SECTOR];
-        for i in 0..data.len() / SECTOR {
-            data[i * SECTOR..(i + 1) * SECTOR].fill((i as u8).wrapping_mul(37).wrapping_add(11));
+    fn filled(sectors: usize) -> Self {
+        let mut data = vec![0; sectors * SECTOR];
+        for (lba, sector) in data.chunks_exact_mut(SECTOR).enumerate() {
+            sector.fill((lba as u8).wrapping_mul(37).wrapping_add(11));
         }
         Self {
             data,
-            partition: Partition {
-                start: OLD,
-                len: LEN,
-                type_guid: ORIGINAL_GUID,
-            },
-            ops: 0,
+            partition: Partition::new(OLD, LEN, &ORIGINAL_GUID, &LABEL),
+            operations: 0,
             faults: Faults::default(),
-            min_free_lba: 0,
+            unavailable: Vec::new(),
         }
     }
 
-    /// Count an operation and simulate a failure configured to happen before it.
     fn begin(&mut self) -> Result<u64, Error> {
-        self.ops += 1;
-        if self.faults.crash_before == Some(self.ops) {
-            return Err(Error::Io(std::io::Error::other("simulated crash")));
+        self.operations += 1;
+        if self.faults.before == Some(self.operations) {
+            return Err(io_error("simulated crash before operation"));
         }
-        Ok(self.ops)
+        Ok(self.operations)
     }
 
-    /// Simulate a failure configured to happen after operation `op`.
-    fn end(&self, op: u64) -> Result<(), Error> {
-        if self.faults.crash_after == Some(op) {
-            return Err(Error::Io(std::io::Error::other("simulated crash")));
+    fn end(&self, operation: u64) -> Result<(), Error> {
+        if self.faults.after == Some(operation) {
+            return Err(io_error("simulated crash after operation"));
         }
         Ok(())
     }
 
-    /// Convert an LBA and byte length into a checked range in the backing vector.
     fn span(&self, lba: u64, len: usize) -> Result<std::ops::Range<usize>, Error> {
         let start = usize::try_from(lba)
             .ok()
-            .and_then(|lba| lba.checked_mul(SECTOR))
-            .ok_or_else(|| Error::Io(std::io::Error::other("lba overflow")))?;
-        let end = start + len;
-        if end > self.data.len() {
-            return Err(Error::Io(std::io::Error::other(format!(
-                "lba {lba} outside the mock"
-            ))));
+            .and_then(|n| n.checked_mul(SECTOR))
+            .ok_or_else(|| io_error("LBA overflow"))?;
+        let end = start.checked_add(len).ok_or_else(|| io_error("range overflow"))?;
+        if end > self.data.len() || len != SECTOR {
+            return Err(io_error("sector outside mock disk or wrong sector size"));
         }
         Ok(start..end)
     }
 
-    /// Copy a contiguous region of sectors for assertions.
     fn region(&self, lba: u64, sectors: u64) -> Vec<u8> {
         let start = lba as usize * SECTOR;
-        self.data[start..start + sectors as usize * SECTOR].to_vec()
+        let end = start + sectors as usize * SECTOR;
+        self.data[start..end].to_vec()
     }
+
+    fn block_range(&mut self, start: u64, end: u64) {
+        self.unavailable.push((start, end));
+    }
+}
+
+fn io_error(message: &str) -> Error {
+    Error::ioerror(message)
 }
 
 impl Disk for MockDisk {
@@ -114,269 +107,208 @@ impl Disk for MockDisk {
     }
 
     fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Error> {
-        let op = self.begin()?;
+        let operation = self.begin()?;
         let range = self.span(lba, buf.len())?;
         buf.copy_from_slice(&self.data[range]);
-        self.end(op)
+        self.end(operation)
     }
 
     fn write_sector(&mut self, lba: u64, buf: &[u8]) -> Result<(), Error> {
-        let op = self.begin()?;
+        let operation = self.begin()?;
         let range = self.span(lba, buf.len())?;
-        if self.faults.tear == Some(op) {
-            let written = buf.len() / 2;
-            self.data[range.start..range.start + written].copy_from_slice(&buf[..written]);
-            return Err(Error::Io(std::io::Error::other("simulated torn write")));
+        if self.faults.tear == Some(operation) {
+            let half = buf.len() / 2;
+            self.data[range.start..range.start + half].copy_from_slice(&buf[..half]);
+            return Err(io_error("simulated torn sector write"));
         }
         self.data[range.clone()].copy_from_slice(buf);
-        if self.faults.corrupt == Some(op) {
-            self.data[range.start] ^= 0xFF;
-        }
-        self.end(op)
+        self.end(operation)
     }
 
     fn sync(&mut self) -> Result<(), Error> {
-        let op = self.begin()?;
-        self.end(op)
+        let operation = self.begin()?;
+        self.end(operation)
     }
 
-    fn partition(&mut self) -> Result<Partition, Error> {
-        let op = self.begin()?;
-        self.end(op)?;
-        Ok(self.partition)
+    fn list_partitions(&mut self) -> Result<Vec<Partition>, Error> {
+        let operation = self.begin()?;
+        let partition = self.partition;
+        self.end(operation)?;
+        Ok(vec![partition])
     }
 
-    fn set_partition(&mut self, start: u64, len: u64) -> Result<(), Error> {
-        let op = self.begin()?;
-        self.partition.start = start;
-        self.partition.len = len;
-        self.end(op)
+    fn update_partition(&mut self, index: usize, partition: Partition) -> Result<(), Error> {
+        let operation = self.begin()?;
+        if index != 0 {
+            return Err(io_error("invalid partition index"));
+        }
+        self.partition = partition;
+        self.end(operation)
     }
 
-    fn set_type_guid(&mut self, guid: [u8; 16]) -> Result<(), Error> {
-        let op = self.begin()?;
-        self.partition.type_guid = guid;
-        self.end(op)
-    }
-
-    fn range_is_free(&mut self, start: u64, _len: u64) -> Result<bool, Error> {
-        let op = self.begin()?;
-        self.end(op)?;
-        Ok(start >= self.min_free_lba)
-    }
-}
-
-/// Build the common test request with configurable target and verification mode.
-fn request(new_start: u64, verify: Verify) -> MoveRequest {
-    MoveRequest {
-        old_start: OLD,
-        new_start,
-        len: LEN,
-        chunk_size: CHUNK,
-        subchunk_size: SUB,
-        verify,
+    /// `start_lba..end_lba` is an exclusive-end range.
+    fn is_range_free(&mut self, start_lba: u64, end_lba: u64) -> Result<bool, Error> {
+        let operation = self.begin()?;
+        let free = !self
+            .unavailable
+            .iter()
+            .any(|&(start, end)| start_lba < end && start < end_lba);
+        self.end(operation)?;
+        Ok(free)
     }
 }
 
-/// Assert that the partition reached the target extent with original contents/GUID.
-fn moved(disk: &MockDisk, new_start: u64, expected: &[u8]) {
-    assert_eq!(disk.partition.start, new_start, "partition start");
-    assert_eq!(disk.partition.len, LEN, "partition length");
-    assert_eq!(
-        disk.partition.type_guid, ORIGINAL_GUID,
-        "type GUID restored"
-    );
-    assert_eq!(disk.region(new_start, LEN), expected, "partition contents");
+fn make_record(disk: &MockDisk, displacement: i64) -> Record {
+    Record::new(
+        SECTOR as u32,
+        disk.partition,
+        displacement,
+        CHUNK,
+        SUBCHUNK,
+    )
+    .unwrap_or_else(|e| panic!("invalid test record: {e}"))
 }
 
-/// Assert that the move did not start and the original partition is unchanged.
-fn untouched(disk: &MockDisk, expected: &[u8]) {
-    assert_eq!(disk.partition.start, OLD, "partition start");
-    assert_eq!(disk.partition.len, LEN, "partition length");
-    assert_eq!(disk.partition.type_guid, ORIGINAL_GUID, "type GUID");
-    assert_eq!(disk.region(OLD, LEN), expected, "partition contents");
+fn start_move(disk: &mut MockDisk, displacement: i64) -> Result<(), Error> {
+    let record = make_record(disk, displacement);
+    continue_(disk, 0, record, None)
 }
 
-/// Either the move never started, or it finished. Nothing in between.
-/// Assert that recovery left the disk either fully original or fully moved.
-fn assert_settled(disk: &MockDisk, new_start: u64, expected: &[u8]) {
-    if disk.partition.start == OLD && disk.partition.type_guid == ORIGINAL_GUID {
-        untouched(disk, expected);
+fn moved(disk: &MockDisk, new_start: u64, original: &[u8]) {
+    assert_eq!(disk.partition.start(), new_start, "partition start");
+    assert_eq!(disk.partition.len(), LEN, "partition length");
+    assert_eq!(disk.partition.guid(), &ORIGINAL_GUID, "partition GUID");
+    assert_eq!(disk.region(new_start, LEN), original, "partition contents");
+}
+
+fn untouched(disk: &MockDisk, original: &[u8]) {
+    assert_eq!(disk.partition.start(), OLD, "partition start");
+    assert_eq!(disk.partition.len(), LEN, "partition length");
+    assert_eq!(disk.partition.guid(), &ORIGINAL_GUID, "partition GUID");
+    assert_eq!(disk.region(OLD, LEN), original, "partition contents");
+}
+
+fn assert_settled(disk: &MockDisk, new_start: u64, original: &[u8]) {
+    if disk.partition.start() == OLD && disk.partition.guid() == &ORIGINAL_GUID {
+        untouched(disk, original);
     } else {
-        moved(disk, new_start, expected);
+        moved(disk, new_start, original);
     }
 }
 
-/// Inject a crash before and after every operation, then require recovery to settle.
-fn crash_everywhere(new_start: u64, use_store: bool, min_free_lba: u64) {
+/// A crash during Widen can precede the partition-table update, leaving the
+/// new record outside the old partition's scan locations. That case is safe
+/// to retry; otherwise recover the on-disk record and finish the move.
+fn recover_or_accept_unstarted(disk: &mut MockDisk, new_start: u64, original: &[u8]) {
+    match recover_record(disk, None) {
+        Ok((index, record)) => {
+            continue_(disk, index, record, None)
+                .unwrap_or_else(|e| panic!("recovery failed: {e}"));
+        }
+        Err(e) => panic!("record recovery failed: {e}"),
+        Err(e) => panic!("record recovery failed unexpectedly: {e}"),
+    }
+}
+
+fn crash_at_every_operation(displacement: i64, blocked: Option<(u64, u64)>) {
+    let new_start = (OLD as i64 + displacement) as u64;
     let mut baseline = MockDisk::filled(4096);
-    baseline.min_free_lba = min_free_lba;
-    let expected = baseline.region(OLD, LEN);
-    execute(&mut baseline, None, Some(request(new_start, Verify::Full))).unwrap();
-    let total = baseline.ops;
-    assert!(total > 20, "baseline only performed {total} operations");
+    if let Some((start, end)) = blocked {
+        baseline.block_range(start, end);
+    }
+    let original = baseline.region(OLD, LEN);
+    start_move(&mut baseline, displacement)
+        .unwrap_or_else(|e| panic!("baseline move failed: {e}"));
+    let operation_count = baseline.operations;
+    assert!(operation_count > 20, "unexpectedly few operations: {operation_count}");
 
-    for crash_at in 1..=total {
-        for before in [true, false] {
+    for operation in 1..=operation_count {
+        for crash_before in [true, false] {
             let mut disk = MockDisk::filled(4096);
-            disk.min_free_lba = min_free_lba;
-            disk.faults.crash_before = before.then_some(crash_at);
-            disk.faults.crash_after = (!before).then_some(crash_at);
-            let mut store = MemStore::new();
-            let store_ref = use_store.then_some(&mut store as &mut dyn RecordStore);
-            let _ = execute(&mut disk, store_ref, Some(request(new_start, Verify::Full)));
-
-            disk.faults = Faults::default();
-            let store_ref = use_store.then_some(&mut store as &mut dyn RecordStore);
-            match execute(&mut disk, store_ref, None) {
-                Ok(()) => moved(&disk, new_start, &expected),
-                Err(Error::NoRecord) => assert_settled(&disk, new_start, &expected),
-                Err(e) => {
-                    panic!("crash at op {crash_at} (before={before}) was not recoverable: {e}")
-                }
+            if let Some((start, end)) = blocked {
+                disk.block_range(start, end);
             }
-            assert_settled(&disk, new_start, &expected);
+            if crash_before {
+                disk.faults.before = Some(operation);
+            } else {
+                disk.faults.after = Some(operation);
+            }
+
+            let _ = start_move(&mut disk, displacement);
+            disk.faults = Faults::default();
+            recover_or_accept_unstarted(&mut disk, new_start, &original);
+            assert_settled(&disk, new_start, &original);
         }
     }
 }
 
 #[test]
-/// Crash before/after every operation during a forward relocation.
-fn every_crash_forward() {
-    crash_everywhere(OLD + 23, false, 0);
+fn clean_moves_preserve_data_in_both_directions() {
+    for displacement in [23, -17] {
+        let mut disk = MockDisk::filled(4096);
+        let original = disk.region(OLD, LEN);
+        start_move(&mut disk, displacement)
+            .unwrap_or_else(|e| panic!("move failed: {e}"));
+        moved(&disk, (OLD as i64 + displacement) as u64, &original);
+    }
 }
 
 #[test]
-/// Crash before/after every operation during a backward relocation.
-fn every_crash_backward() {
-    crash_everywhere(OLD - 17, false, 0);
+fn every_operation_is_crash_recoverable_forward() {
+    crash_at_every_operation(23, None);
 }
 
 #[test]
-/// Fall back to the record-after placement when the before side is outside
-/// the usable GPT range, and recover every crash point with that placement.
-fn every_crash_backward_with_before_side_unavailable() {
-    crash_everywhere(OLD - 17, false, OLD - 17);
+fn every_operation_is_crash_recoverable_backward() {
+    crash_at_every_operation(-17, None);
 }
 
 #[test]
-/// Repeat forward crash injection with an external record mirror.
-fn every_crash_forward_with_store() {
-    crash_everywhere(OLD + 23, true, 0);
+fn backward_move_uses_the_other_record_placement_when_preferred_side_is_blocked() {
+    // A backward move prefers the high-LBA record slot. Block it so Widen
+    // must place the two record sectors on the low-LBA side instead.
+    crash_at_every_operation(-17, Some((OLD + LEN, OLD + LEN + 2)));
 }
 
 #[test]
-/// Repeat backward crash injection with an external record mirror.
-fn every_crash_backward_with_store() {
-    crash_everywhere(OLD - 17, true, 0);
-}
-
-#[test]
-/// Verify recovery after each possible simulated half-sector write.
-fn every_torn_write_is_recoverable() {
-    for new_start in [OLD + 23, OLD - 17] {
+fn every_sector_write_can_be_torn_without_losing_recoverability() {
+    for displacement in [23, -17] {
+        let new_start = (OLD as i64 + displacement) as u64;
         let mut baseline = MockDisk::filled(4096);
-        let expected = baseline.region(OLD, LEN);
-        execute(&mut baseline, None, Some(request(new_start, Verify::Full))).unwrap();
-        let total = baseline.ops;
+        let original = baseline.region(OLD, LEN);
+        start_move(&mut baseline, displacement)
+            .unwrap_or_else(|e| panic!("baseline move failed: {e}"));
+        let operation_count = baseline.operations;
 
-        for op in 1..=total {
+        for operation in 1..=operation_count {
             let mut disk = MockDisk::filled(4096);
-            disk.faults.tear = Some(op);
-            let _ = execute(&mut disk, None, Some(request(new_start, Verify::Full)));
+            disk.faults.tear = Some(operation);
+            let _ = start_move(&mut disk, displacement);
             disk.faults = Faults::default();
-            if let Err(e) = execute(&mut disk, None, None)
-                && !matches!(e, Error::NoRecord)
-            {
-                panic!("tearing op {op} was not recoverable: {e}");
-            }
-            assert_settled(&disk, new_start, &expected);
+            recover_or_accept_unstarted(&mut disk, new_start, &original);
+            assert_settled(&disk, new_start, &original);
         }
     }
 }
 
 #[test]
-/// Verify ordinary forward and backward moves preserve all data.
-fn clean_moves_both_directions() {
-    for new_start in [OLD + 23, OLD - 17] {
-        let mut disk = MockDisk::filled(4096);
-        let expected = disk.region(OLD, LEN);
-        execute(&mut disk, None, Some(request(new_start, Verify::Full))).unwrap();
-        moved(&disk, new_start, &expected);
-    }
-}
-
-#[test]
-/// Ensure full verification detects data corruption in a copied chunk.
-fn full_verification_rejects_a_corrupted_copy() {
-    let mut baseline = MockDisk::filled(4096);
-    execute(&mut baseline, None, Some(request(OLD + 23, Verify::Full))).unwrap();
-
-    for op in 1..=baseline.ops {
-        let mut disk = MockDisk::filled(4096);
-        disk.faults.corrupt = Some(op);
-        let result = execute(&mut disk, None, Some(request(OLD + 23, Verify::Full)));
-        if matches!(result, Err(Error::Verify(_))) {
-            return;
-        }
-    }
-    panic!("no corrupted write produced a verification failure");
-}
-
-#[test]
-/// Exercise all verification policies on forward and backward moves.
-fn all_verification_modes_move_the_data() {
-    for verify in [Verify::None, Verify::Checkpoints, Verify::Full] {
-        let mut disk = MockDisk::filled(4096);
-        let expected = disk.region(OLD, LEN);
-        execute(&mut disk, None, Some(request(OLD - 17, verify))).unwrap();
-        moved(&disk, OLD - 17, &expected);
-    }
-}
-
-#[test]
-/// Ensure a non-overlapping relocation is rejected as unsupported.
-fn disjoint_move_is_unsupported() {
+fn a_clean_disk_has_no_recoverable_record() {
     let mut disk = MockDisk::filled(4096);
-    let err = execute(&mut disk, None, Some(request(OLD + LEN, Verify::None))).unwrap_err();
-    assert!(matches!(err, Error::Unsupported(_)), "{err}");
+    assert!(matches!(recover_record(&mut disk, None), Err(Error::Invalid(_))));
 }
 
 #[test]
-/// Ensure a zero-distance move is rejected.
-fn zero_displacement_is_invalid() {
+fn marker_partition_without_a_valid_record_is_rejected() {
     let mut disk = MockDisk::filled(4096);
-    let err = execute(&mut disk, None, Some(request(OLD, Verify::None))).unwrap_err();
-    assert!(matches!(err, Error::Invalid(_)), "{err}");
+    disk.partition = Partition::new(OLD, LEN, &MARKER_TYPE_GUID, &LABEL);
+    assert!(matches!(recover_record(&mut disk, None), Err(Error::Invalid(_))));
 }
 
 #[test]
-/// Ensure recovery reports no record when no move is active.
-fn a_clean_disk_has_nothing_to_recover() {
-    let mut disk = MockDisk::filled(4096);
-    assert!(matches!(
-        execute(&mut disk, None, None),
-        Err(Error::NoRecord)
-    ));
-}
-
-#[test]
-/// Ensure a marker without a valid record is reported as corruption.
-fn a_marked_partition_without_a_record_is_an_error() {
-    let mut disk = MockDisk::filled(4096);
-    disk.partition.type_guid = MARKER_TYPE_GUID;
-    let err = execute(&mut disk, None, None).unwrap_err();
-    assert!(matches!(err, Error::Corrupt(_)), "{err}");
-}
-
-#[test]
-/// Ensure chunk and subchunk values are bounded to safe sizes.
-fn oversized_chunk_and_subchunk_are_clamped() {
-    let mut disk = MockDisk::filled(4096);
-    let expected = disk.region(OLD, LEN);
-    let mut req = request(OLD + 5, Verify::Full);
-    req.chunk_size = 1_000_000;
-    req.subchunk_size = 1_000_000;
-    execute(&mut disk, None, Some(req)).unwrap();
-    moved(&disk, OLD + 5, &expected);
+fn record_rejects_zero_or_out_of_range_chunk_sizes() {
+    let disk = MockDisk::filled(4096);
+    assert!(Record::new(SECTOR as u32, disk.partition, 23, 0, 1).is_err());
+    assert!(Record::new(SECTOR as u32, disk.partition, 23, 24, 1).is_err());
+    assert!(Record::new(SECTOR as u32, disk.partition, 23, 7, 0).is_err());
+    assert!(Record::new(SECTOR as u32, disk.partition, 23, 7, 8).is_err());
 }
