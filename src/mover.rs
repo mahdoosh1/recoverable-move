@@ -21,7 +21,7 @@ use crate::traits::{Disk, FileWriter, Partition};
 use crate::errors::Error;
 
 // we need a phase
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Phase {
     Widen = 0,
     Zero = 4,

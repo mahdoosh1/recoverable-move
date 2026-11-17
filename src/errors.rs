@@ -16,7 +16,7 @@
 // along with recoverable-move. If not, see <https://www.gnu.org/licenses/>.
 
 use std::fmt::Display;
-
+#[derive(PartialEq)]
 pub enum Error {
     IoError(String),
     Invalid(String)

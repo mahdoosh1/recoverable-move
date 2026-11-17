@@ -14,6 +14,10 @@
 
 //! Fault-injection tests for the current `Disk` / `Record` / `continue_` API.
 
+
+// THIS CODE IS AI GENERATED (by ChatGPT)
+
+
 use recoverable_move::consts::MARKER_TYPE_GUID;
 use recoverable_move::errors::Error;
 use recoverable_move::mover::{continue_, recover_record};
@@ -199,14 +203,28 @@ fn assert_settled(disk: &MockDisk, new_start: u64, original: &[u8]) {
 /// A crash during Widen can precede the partition-table update, leaving the
 /// new record outside the old partition's scan locations. That case is safe
 /// to retry; otherwise recover the on-disk record and finish the move.
-fn recover_or_accept_unstarted(disk: &mut MockDisk, new_start: u64, original: &[u8]) {
+fn recover_or_accept_unstarted(disk: &mut MockDisk, new_start: u64) {
     match recover_record(disk, None) {
         Ok((index, record)) => {
             continue_(disk, index, record, None)
                 .unwrap_or_else(|e| panic!("recovery failed: {e}"));
         }
+        Err(Error::Invalid(_))
+            if disk.partition.start() == OLD
+                && disk.partition.len() == LEN
+                && disk.partition.guid() == &ORIGINAL_GUID =>
+        {
+            // The move did not reach the marker-partition update.
+        }
+        Err(Error::Invalid(_))
+            if disk.partition.start() == new_start
+                && disk.partition.len() == LEN
+                && disk.partition.guid() == &ORIGINAL_GUID =>
+        {
+            // Resize updated the partition table, but record cleanup
+            // may not have completed. The move itself is complete.
+        }
         Err(e) => panic!("record recovery failed: {e}"),
-        Err(e) => panic!("record recovery failed unexpectedly: {e}"),
     }
 }
 
@@ -236,7 +254,7 @@ fn crash_at_every_operation(displacement: i64, blocked: Option<(u64, u64)>) {
 
             let _ = start_move(&mut disk, displacement);
             disk.faults = Faults::default();
-            recover_or_accept_unstarted(&mut disk, new_start, &original);
+            recover_or_accept_unstarted(&mut disk, new_start);
             assert_settled(&disk, new_start, &original);
         }
     }
@@ -285,7 +303,7 @@ fn every_sector_write_can_be_torn_without_losing_recoverability() {
             disk.faults.tear = Some(operation);
             let _ = start_move(&mut disk, displacement);
             disk.faults = Faults::default();
-            recover_or_accept_unstarted(&mut disk, new_start, &original);
+            recover_or_accept_unstarted(&mut disk, new_start);
             assert_settled(&disk, new_start, &original);
         }
     }

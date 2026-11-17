@@ -153,21 +153,37 @@ impl Record {
         if self.subchunk_size == 0 || self.subchunk_size > self.chunk_size {
             return Err(Error::invalid("subchunk size is out of range"));
         }
-        if self.chunks_done > self.chunks_total() {
-            return Err(Error::invalid("chunk progress exceeds the chunk count"));
-        }
-        if self.phase != Phase::Widen && self.records_lba == 0 {
-            return Err(Error::invalid("record lba not defined ( records_lba = 0 )"))
-        }
         if self.partition.len() == 0 {
             return Err(Error::invalid("zero-sized partition"));
         }
+        if self.phase != Phase::Widen && self.records_lba == 0 {
+            return Err(Error::invalid("record lba not defined (records_lba = 0)"));
+        }
+
+        let total = self.chunks_total();
+
+        if self.chunks_done > total {
+            return Err(Error::invalid(format!(
+                "chunks_done ({}) exceeds chunks_total ({total})",
+                self.chunks_done
+            )));
+        }
         if self.phase == Phase::Widen && self.chunks_done != 0 {
-            return Err(Error::invalid("phase and chunks_done don't match"))
+            return Err(Error::invalid("Widen requires chunks_done = 0"));
         }
-        if self.chunks_done == self.chunk_size && self.phase != Phase::Resize {
-            return Err(Error::invalid("phase and chunks_done don't match"))
+        if self.phase == Phase::Resize && self.chunks_done != total {
+            return Err(Error::invalid(format!(
+                "Resize requires chunks_done = chunks_total ({total}), got {}",
+                self.chunks_done
+            )));
         }
+        if self.phase != Phase::Resize && self.chunks_done == total {
+            return Err(Error::invalid(format!(
+                "all chunks completed but phase is not Resize (phase = {}, chunks_done = {total})",
+                self.phase as u8
+            )));
+        }
+
         Ok(())
     }
     pub fn chunks_total(&self) -> u64 {
