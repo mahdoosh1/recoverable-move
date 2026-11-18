@@ -121,8 +121,8 @@ impl Disk for MockDisk {
         let operation = self.begin()?;
         let range = self.span(lba, buf.len())?;
         if self.faults.tear == Some(operation) {
-            let half = buf.len() / 2;
-            self.data[range.start..range.start + half].copy_from_slice(&buf[..half]);
+            let quarter = buf.len() / 4;
+            self.data[range.start..range.start + quarter].copy_from_slice(&buf[..quarter]);
             return Err(io_error("simulated torn sector write"));
         }
         self.data[range.clone()].copy_from_slice(buf);

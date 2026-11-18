@@ -16,7 +16,7 @@
 // along with recoverable-move. If not, see <https://www.gnu.org/licenses/>.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::errors::Error;
@@ -78,7 +78,9 @@ impl FileWriter {
         Ok(())
     }
     pub fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(data)?;
+        self.file.sync_all()?;
         Ok(())
     }
 }

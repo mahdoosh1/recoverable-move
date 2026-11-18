@@ -20,7 +20,6 @@ A Rust library and interactive command-line utility for crash-recoverable reloca
 ## Requirements
 
 - Rust 1.98 or later.
-- Linux or another Unix platform supported by `std::os::unix::fs::FileExt`.
 - A GPT-formatted disk image or block device.
 - Read and write permissions for the target.
 

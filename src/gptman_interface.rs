@@ -17,9 +17,9 @@
 
 use std::{
     fs::{File, OpenOptions},
-    os::unix::fs::FileExt,
     path::Path,
 };
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use gptman::GPT;
 
@@ -58,8 +58,9 @@ impl Disk for GptDisk {
                 "the buffer is not the same size as sector_size",
             ));
         }
-        self.file
-            .read_exact_at(buf, lba * self.sector_size as u64)?;
+        self.file.seek(SeekFrom::Start(lba * self.sector_size as u64))?;
+        let read = self.file.read(buf)?;
+        if read != self.sector_size { return Err(Error::ioerror("incomplete read")); }
         Ok(())
     }
 
@@ -69,7 +70,10 @@ impl Disk for GptDisk {
                 "the buffer is not the same size as sector_size",
             ));
         }
-        self.file.write_all_at(buf, lba * self.sector_size as u64)?;
+        self.file.seek(SeekFrom::Start(lba * self.sector_size as u64))?;
+        let written = self.file.write(buf)?;
+        self.file.sync_all()?;
+        if written != self.sector_size { return Err(Error::ioerror("incomplete write")); }
         Ok(())
     }
 

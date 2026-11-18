@@ -140,11 +140,14 @@ pub fn continue_(
             Phase::Widen => {
                 // if a power loss happens in this phase, data is still safe even if the record won't be found by recover_record
                 // the inconveniance is that the user will have to redo the operation.
-                let min_ = record
-                    .partition()
+                let old = record.partition();
+                let new = record.partition_after();
+                let min_ = old
                     .start()
-                    .min(record.partition_after().start());
-                let max_ = record.partition().end().max(record.partition_after().end());
+                    .min(new.start());
+                let max_ = old
+                    .end()
+                    .max(new.end());
                 if record.displacement > 0 {
                     if disk.is_range_free(min_ - 2, min_)? {
                         placement = false;
@@ -152,6 +155,9 @@ pub fn continue_(
                         placement = true;
                     } else {
                         return Err(Error::invalid("no space left for the record"));
+                    }
+                    if !disk.is_range_free(new.start().max(old.end()), new.end())? {
+                        return Err(Error::invalid("destination overlaps with occupied space (possibly another partition)"));
                     }
                 } else {
                     if disk.is_range_free(max_, max_ + 2)? {
@@ -161,14 +167,18 @@ pub fn continue_(
                     } else {
                         return Err(Error::invalid("no space left for the record"));
                     }
+                    if !disk.is_range_free(new.start(), new.end().min(old.start()))? {
+                        return Err(Error::invalid("destination overlaps with occupied space (possibly another partition)"));
+                    }
                 }
+
                 let partition;
                 if placement {
                     partition = Partition::new(
                         min_,
                         max_ - min_ + 2,
                         &MARKER_TYPE_GUID,
-                        record.partition().label(),
+                        old.label(),
                     );
                     records_lba = max_;
                 } else {
@@ -176,7 +186,7 @@ pub fn continue_(
                         min_ - 2,
                         max_ - min_ + 2,
                         &MARKER_TYPE_GUID,
-                        record.partition().label(),
+                        old.label(),
                     );
                     records_lba = min_ - 2;
                 };
