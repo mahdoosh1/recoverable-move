@@ -183,6 +183,7 @@ pub fn continue_(
                 record.records_lba = records_lba;
                 record.phase = Phase::Zero;
                 write_record(record, disk, records_lba, file.as_mut())?;
+                disk.sync()?;
                 disk.update_partition(partition_index, partition)?;
                 disk.sync()?;
             }
