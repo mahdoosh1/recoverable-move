@@ -99,7 +99,7 @@ Commands:
 }
 
 fn run(path: impl AsRef<Path>) -> Result<(), Error> {
-    let mut disk = gptman_interface::create_disk(&path)?;
+    let mut disk = gptman_interface::GptDisk::open(&path)?;
     let mut partitions = disk.list_partitions()?;
     print_help();
     print_partitions(&partitions);
@@ -136,29 +136,33 @@ fn ask_the_user_for_string(text: &'static str) -> Result<String, Error> {
 
 fn move_partition(path: impl AsRef<Path>) -> Result<(), Error> {
     let index: usize = ask_the_user_for_integer("Partition index: ")?;
+    let index = index
+        .checked_sub(1)
+        .ok_or(Error::invalid("partition index starts at 1"))?;
     let mut disk = GptDisk::open(path)?;
-    let current = *disk
+    let current = disk
         .list_partitions()?
-        .get_mut(index - 1)
-        .ok_or(Error::invalid("no partition at this index"))?;
+        .get(index)
+        .ok_or(Error::invalid("no partition at this index"))? // .get error
+        .ok_or(Error::invalid("no partition at this index"))?; // Option<Partition>
     let old_start = current.start();
     let len = current.len();
     let old_end = current.end();
-    println!("partition {index}: LBA {old_start}..={old_end} ({len} sectors)");
+    println!("partition {}: LBA {old_start}..{old_end} ({len} sectors)", index+1);
     let new_start: u64 = ask_the_user_for_integer("New start LBA: ")?;
-    let displacement = (i128::from(new_start) - i128::from(old_start)) as i64;
+    if new_start >= u64::MAX / 2 {
+        return Err(Error::invalid("Woah! do you even have space for this?"));
+    }
+    let displacement = new_start as i64 - old_start as i64;
     if displacement == 0 {
         return Err(Error::invalid(
             "displacement is zero (partition already there)",
         ));
     }
     let max_chunk = displacement.unsigned_abs();
-    let new_end = new_start
-        .checked_add(len - 1)
-        .ok_or_else(|| Error::invalid("new partition end overflows".to_string()))?;
+    let new_end = new_start + len;
     println!("Default chunk (sectors) = {max_chunk}");
-    let chunk =
-        ask_the_user_for_integer::<u64>("Chunk (sectors, blank = default): ").unwrap_or(max_chunk);
+    let chunk: u64 = ask_the_user_for_integer("Chunk (sectors, non-integer input = default): ").unwrap_or(max_chunk);
     if chunk == 0 || chunk > max_chunk {
         return Err(Error::invalid(format!(
             "chunk must be in 1..={max_chunk} sectors"
@@ -167,7 +171,7 @@ fn move_partition(path: impl AsRef<Path>) -> Result<(), Error> {
     let subchunk: u64 = ask_the_user_for_integer("Subchunk (sectors): ")?;
     if subchunk == 0 || subchunk > chunk {
         return Err(Error::invalid(format!(
-            "subchunk must be in 1..={chunk} sectors"
+            "subchunk must be in 1..{chunk} sectors"
         )));
     }
     let store_path = ask_the_user_for_string("Metadata mirror path (blank = none): ")?;
@@ -178,9 +182,9 @@ fn move_partition(path: impl AsRef<Path>) -> Result<(), Error> {
     };
 
     let chunks = len.div_ceil(chunk);
-    println!("\nabout to move partition {index}:");
-    println!("  from LBA {old_start}..={old_end}");
-    println!("  to   LBA {new_start}..={new_end} (displacement {displacement:+})");
+    println!("\nabout to move partition {}:", index+1);
+    println!("  from LBA {old_start}..{old_end}");
+    println!("  to   LBA {new_start}..{new_end} (displacement {displacement:+})");
     println!("  chunk    {chunk} sectors → {chunks} chunk(s)");
     println!("  subchunk {subchunk} sectors");
     println!(
@@ -206,7 +210,7 @@ fn move_partition(path: impl AsRef<Path>) -> Result<(), Error> {
         Some(path) => Some(FileWriter::new(path)?),
         None => None,
     };
-    continue_(&mut disk, index - 1, record, file)?;
+    continue_(&mut disk, index, record, file)?;
     println!("\nmove complete\n");
     Ok(())
 }
@@ -262,13 +266,16 @@ fn recover(path: impl AsRef<Path>) -> Result<(), Error> {
     Ok(())
 }
 
-fn print_partitions(partitions: &[Partition]) {
+fn print_partitions(partitions: &[Option<Partition>]) {
     println!(
         "{:<4} {:<36} {:>12} {:>12} {:>12} Label",
         "Idx", "GUID", "Start", "End", "Size"
     );
 
     for (i, partition) in partitions.iter().enumerate() {
+        let Some(partition) = partition else {
+            continue
+        };
         let guid = uuid::Uuid::from_slice_le(partition.guid()).unwrap();
 
         println!(

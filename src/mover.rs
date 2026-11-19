@@ -51,6 +51,9 @@ pub fn recover_record(
 ) -> Result<(usize, Record), Error> {
     let partitions = disk.list_partitions()?;
     for (index, partition) in partitions.iter().enumerate() {
+        let Some(partition) = partition else {
+            continue;
+        };
         // try anyways
         let checks = [
             partition.start(),

@@ -134,11 +134,11 @@ impl Disk for MockDisk {
         self.end(operation)
     }
 
-    fn list_partitions(&mut self) -> Result<Vec<Partition>, Error> {
+    fn list_partitions(&mut self) -> Result<Vec<Option<Partition>>, Error> {
         let operation = self.begin()?;
         let partition = self.partition;
         self.end(operation)?;
-        Ok(vec![partition])
+        Ok(vec![Some(partition)])
     }
 
     fn update_partition(&mut self, index: usize, partition: Partition) -> Result<(), Error> {

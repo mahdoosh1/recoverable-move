@@ -59,8 +59,7 @@ impl Disk for GptDisk {
             ));
         }
         self.file.seek(SeekFrom::Start(lba * self.sector_size as u64))?;
-        let read = self.file.read(buf)?;
-        if read != self.sector_size { return Err(Error::ioerror("incomplete read")); }
+        self.file.read_exact(buf)?;
         Ok(())
     }
 
@@ -71,9 +70,8 @@ impl Disk for GptDisk {
             ));
         }
         self.file.seek(SeekFrom::Start(lba * self.sector_size as u64))?;
-        let written = self.file.write(buf)?;
+        self.file.write_all(buf)?;
         self.file.sync_all()?;
-        if written != self.sector_size { return Err(Error::ioerror("incomplete write")); }
         Ok(())
     }
 
@@ -82,7 +80,7 @@ impl Disk for GptDisk {
         Ok(())
     }
 
-    fn list_partitions(&mut self) -> Result<Vec<Partition>, Error> {
+    fn list_partitions(&mut self) -> Result<Vec<Option<Partition>>, Error> {
         let mut partitions = Vec::new();
         for (index, entry) in self.gpt.iter() {
             let index = index as usize;
@@ -111,10 +109,7 @@ impl Disk for GptDisk {
             }
             partitions[index] = Some(partition);
         }
-        if let Some(index) = partitions.iter().position(|x| x.is_none()) {
-            return Err(Error::invalid(format!("no partition with index {}", index)));
-        }
-        Ok(partitions.into_iter().map(Option::unwrap).collect())
+        Ok(partitions)
     }
 
     fn update_partition(&mut self, index: usize, partition: Partition) -> Result<(), Error> {
@@ -152,8 +147,4 @@ impl Disk for GptDisk {
         }
         Ok(true)
     }
-}
-
-pub fn create_disk(path: impl AsRef<Path>) -> Result<GptDisk, Error> {
-    GptDisk::open(path)
 }

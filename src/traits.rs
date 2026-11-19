@@ -92,7 +92,7 @@ pub trait Disk {
     fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Error>;
     fn write_sector(&mut self, lba: u64, buf: &[u8]) -> Result<(), Error>;
     fn sync(&mut self) -> Result<(), Error>;
-    fn list_partitions(&mut self) -> Result<Vec<Partition>, Error>; // ordered
+    fn list_partitions(&mut self) -> Result<Vec<Option<Partition>>, Error>; // ordered
     fn update_partition(&mut self, index: usize, partition: Partition) -> Result<(), Error>;
     fn is_range_free(&mut self, start_lba: u64, end_lba: u64) -> Result<bool, Error>;
 }
